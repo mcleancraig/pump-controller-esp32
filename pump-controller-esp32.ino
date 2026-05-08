@@ -26,7 +26,7 @@
 // ═══════════════════════════════════════════════════════════
 
 // Dev builds: update SHA suffix with `git rev-parse --short HEAD` after each commit.
-#define FIRMWARE_VERSION "0.1.0-dev.fd8f357"
+#define FIRMWARE_VERSION "0.1.0-dev.fbbf82d"
 
 // ── Hardware constants ────────────────────────────────────
 const int BTN_BOOT  = 9;      // Boot button — GPIO9 on Waveshare C6-Zero / XIAO C6
@@ -50,7 +50,7 @@ const int FOTA_VERSION_TIMEOUT_MS   = 8000;
 const int FOTA_DL_TIMEOUT_MS        = 60000;
 
 // ── AP credentials ────────────────────────────────────────
-const char* AP_PASSWORD = "moisture";
+const char* AP_PASSWORD = "pumpcontroller";
 
 // ── NTP ───────────────────────────────────────────────────
 const char* NTP_SERVER   = "pool.ntp.org";
@@ -129,16 +129,16 @@ void loadConfig() {
   cfg.staticIP    = prefs.getBool("staticIP", false);
 
   if (prefs.getBytes("ip",  cfg.ip,  4) == 0) {
-    cfg.ip[0] = 192; cfg.ip[1] = 168; cfg.ip[2] = 220; cfg.ip[3] = 1;
+    cfg.ip[0] = 192; cfg.ip[1] = 168; cfg.ip[2] = 211; cfg.ip[3] = 1;
   }
   if (prefs.getBytes("gw",  cfg.gw,  4) == 0) {
-    cfg.gw[0] = 192; cfg.gw[1] = 168; cfg.gw[2] =   1; cfg.gw[3] = 1;
+    cfg.gw[0] = 192; cfg.gw[1] = 168; cfg.gw[2] = 211; cfg.gw[3] = 1;
   }
   if (prefs.getBytes("sn",  cfg.sn,  4) == 0) {
-    cfg.sn[0] = 255; cfg.sn[1] = 255; cfg.sn[2] =   0; cfg.sn[3] = 0;
+    cfg.sn[0] = 255; cfg.sn[1] = 255; cfg.sn[2] = 0; cfg.sn[3] = 0;
   }
   if (prefs.getBytes("dns", cfg.dns, 4) == 0) {
-    cfg.dns[0] = 192; cfg.dns[1] = 168; cfg.dns[2] = 1; cfg.dns[3] = 1;
+    cfg.dns[0] = 192; cfg.dns[1] = 168; cfg.dns[2] = 211; cfg.dns[3] = 1;
   }
 
   prefs.getString("mqttBroker", cfg.mqttBroker,  sizeof(cfg.mqttBroker));
@@ -458,7 +458,7 @@ const char CONFIG_HTML[] PROGMEM = R"rawhtml(
         <span>.</span>
         <input type="number" name="ip2" id="ip2" value="168" min="0" max="255">
         <span>.</span>
-        <input type="number" name="ip3" id="ip3" value="220" min="0" max="255">
+        <input type="number" name="ip3" id="ip3" value="211" min="0" max="255">
         <span>.</span>
         <input type="number" name="ip4" id="ip4" min="0" max="255">
       </div>
@@ -468,7 +468,7 @@ const char CONFIG_HTML[] PROGMEM = R"rawhtml(
         <span>.</span>
         <input type="number" name="gw2" value="168" min="0" max="255">
         <span>.</span>
-        <input type="number" name="gw3" value="1" min="0" max="255">
+        <input type="number" name="gw3" value="211" min="0" max="255">
         <span>.</span>
         <input type="number" name="gw4" value="1" min="0" max="255">
       </div>
@@ -488,7 +488,7 @@ const char CONFIG_HTML[] PROGMEM = R"rawhtml(
         <span>.</span>
         <input type="number" name="dns2" value="168" min="0" max="255">
         <span>.</span>
-        <input type="number" name="dns3" value="1" min="0" max="255">
+        <input type="number" name="dns3" value="211" min="0" max="255">
         <span>.</span>
         <input type="number" name="dns4" value="1" min="0" max="255">
       </div>
@@ -552,14 +552,16 @@ function syncNet() {
   document.getElementById('ip4').value = n;
 }
 function toggleNet(chk) {
-  document.getElementById('network-rows').style.display = chk.checked ? '' : 'none';
+  document.getElementById('network-rows').style.display = chk.checked ? 'block' : 'none';
 }
 function togglePw(btn) {
   var inp = btn.parentElement.querySelector('input');
   inp.type = inp.type === 'password' ? 'text' : 'password';
 }
 function updatePumpRows() {
-  var count = parseInt(document.getElementById('pumpCount').value) || 1;
+  var raw = parseInt(document.getElementById('pumpCount').value) || 1;
+  var count = Math.min(Math.max(raw, 1), 5);
+  document.getElementById('pumpCount').value = count;  // clamp visible value too
   var container = document.getElementById('pump-rows');
   container.innerHTML = '';
   for (var i = 0; i < count; i++) {
@@ -749,9 +751,15 @@ static PumpSlot pumpSlot[MAX_PUMPS];
 
 void stopPump(int idx) {
   if (idx < 0 || idx >= MAX_PUMPS) return;
+  bool wasRunning = pumpSlot[idx].running;
   pumpSlot[idx].running = false;
   if (idx < cfg.pumpCount) {
     digitalWrite(cfg.pumpPin[idx], LOW);
+  }
+  if (wasRunning) {
+    logf("Pump %d   — stopped (GPIO%d LOW)\n", idx + 1, cfg.pumpPin[idx]);
+  } else {
+    logf("Pump %d   — stop requested but was already idle\n", idx + 1);
   }
 }
 
@@ -823,6 +831,8 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     int pumpNumber = atoi(topic + prefixLen);   // 1-based
     int idx = pumpNumber - 1;                    // 0-based
     if (idx >= 0 && idx < cfg.pumpCount) {
+      // Serial only — no logf/syslog inside MQTT callback
+      Serial.printf("[mqttCallback] pump %d cmd: '%s'\n", idx + 1, msg);
       pendingPumpCmd.active = true;
       pendingPumpCmd.idx    = idx;
       pendingPumpCmd.water  = (strcmp(msg, "water") == 0);
@@ -857,9 +867,10 @@ void publishConfigState() {
     snprintf(tmp, sizeof(tmp), "%d%s", cfg.pumpDuration[i], i < MAX_PUMPS-1 ? "," : "]");
     strlcat(durs, tmp, sizeof(durs));
   }
-  char payload[400];
+  char payload[420];
   snprintf(payload, sizeof(payload),
     "{\"mqttBroker\":\"%s\",\"mqttPort\":%d,\"mqttUser\":\"%s\","
+    "\"mqttPassword\":\"***\","
     "\"syslogHost\":\"%s\",\"syslogPort\":%d,"
     "\"pumpCount\":%d,\"pumpPins\":%s,\"pumpDurations\":%s}",
     cfg.mqttBroker, cfg.mqttPort, cfg.mqttUser,
@@ -939,7 +950,7 @@ void publishHADiscovery() {
     "\"sw_version\":\"%s\"}",
     UNIT_ID, UNIT_NAME, FIRMWARE_VERSION);
 
-  char payload[512];
+  char payload[768];
 
   // ── Firmware version sensor ───────────────────────────────
   snprintf(payload, sizeof(payload),
@@ -1062,6 +1073,42 @@ void publishHADiscovery() {
     "\"entity_category\":\"config\",%s}",
     UNIT_ID, CONFIG_STATE_TOPIC, CONFIG_SET_TOPIC, dev);
   mqtt.publish(DISC_CFG_PUMP_COUNT, payload, true);
+
+  // ── Config: per-pump GPIO pin and duration ────────────────
+  for (int i = 0; i < cfg.pumpCount; i++) {
+    char discPin[128], discDur[128];
+    snprintf(discPin, sizeof(discPin),
+      "%s/number/%s_cfg_pump%d_pin/config", HA_DISCOVERY_PREFIX, UNIT_ID, i + 1);
+    snprintf(discDur, sizeof(discDur),
+      "%s/number/%s_cfg_pump%d_dur/config", HA_DISCOVERY_PREFIX, UNIT_ID, i + 1);
+
+    snprintf(payload, sizeof(payload),
+      "{\"name\":\"Pump %d GPIO Pin\",\"unique_id\":\"%s_cfg_pump%d_pin\","
+      "\"state_topic\":\"%s\","
+      "\"value_template\":\"{{value_json.pumpPins[%d]}}\","
+      "\"command_topic\":\"%s\",\"command_template\":\"{\\\"pumpPin%d\\\":{{value}}}\","
+      "\"min\":0,\"max\":28,\"mode\":\"box\","
+      "\"entity_category\":\"config\",%s}",
+      i + 1, UNIT_ID, i + 1,
+      CONFIG_STATE_TOPIC, i,
+      CONFIG_SET_TOPIC, i,
+      dev);
+    mqtt.publish(discPin, payload, true);
+
+    snprintf(payload, sizeof(payload),
+      "{\"name\":\"Pump %d Duration (s)\",\"unique_id\":\"%s_cfg_pump%d_dur\","
+      "\"state_topic\":\"%s\","
+      "\"value_template\":\"{{value_json.pumpDurations[%d]}}\","
+      "\"command_topic\":\"%s\",\"command_template\":\"{\\\"pumpDuration%d\\\":{{value}}}\","
+      "\"min\":1,\"max\":%d,\"mode\":\"box\","
+      "\"entity_category\":\"config\",%s}",
+      i + 1, UNIT_ID, i + 1,
+      CONFIG_STATE_TOPIC, i,
+      CONFIG_SET_TOPIC, i,
+      PUMP_MAX_DURATION_S,
+      dev);
+    mqtt.publish(discDur, payload, true);
+  }
 
   logf("MQTT      — HA discovery published\n");
 }
@@ -1268,6 +1315,7 @@ void loop() {
     }
   } else {
     mqtt.loop();
+    mqtt.loop();  // drain up to 2 queued messages per iteration
   }
 
   // ── Process deferred pump command ─────────────────────────
