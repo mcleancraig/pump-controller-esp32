@@ -830,9 +830,10 @@ void publishConfigState() {
     snprintf(tmp, sizeof(tmp), "%d%s", cfg.pumpDuration[i], i < MAX_PUMPS-1 ? "," : "]");
     strlcat(durs, tmp, sizeof(durs));
   }
-  char payload[400];
+  char payload[420];
   snprintf(payload, sizeof(payload),
     "{\"mqttBroker\":\"%s\",\"mqttPort\":%d,\"mqttUser\":\"%s\","
+    "\"mqttPassword\":\"***\","
     "\"syslogHost\":\"%s\",\"syslogPort\":%d,"
     "\"pumpCount\":%d,\"pumpPins\":%s,\"pumpDurations\":%s}",
     cfg.mqttBroker, cfg.mqttPort, cfg.mqttUser,
@@ -912,7 +913,7 @@ void publishHADiscovery() {
     "\"sw_version\":\"%s\"}",
     UNIT_ID, UNIT_NAME, FIRMWARE_VERSION);
 
-  char payload[512];
+  char payload[768];
 
   // ── Firmware version sensor ───────────────────────────────
   snprintf(payload, sizeof(payload),
@@ -1035,6 +1036,42 @@ void publishHADiscovery() {
     "\"entity_category\":\"config\",%s}",
     UNIT_ID, CONFIG_STATE_TOPIC, CONFIG_SET_TOPIC, dev);
   mqtt.publish(DISC_CFG_PUMP_COUNT, payload, true);
+
+  // ── Config: per-pump GPIO pin and duration ────────────────
+  for (int i = 0; i < cfg.pumpCount; i++) {
+    char discPin[128], discDur[128];
+    snprintf(discPin, sizeof(discPin),
+      "%s/number/%s_cfg_pump%d_pin/config", HA_DISCOVERY_PREFIX, UNIT_ID, i + 1);
+    snprintf(discDur, sizeof(discDur),
+      "%s/number/%s_cfg_pump%d_dur/config", HA_DISCOVERY_PREFIX, UNIT_ID, i + 1);
+
+    snprintf(payload, sizeof(payload),
+      "{\"name\":\"Pump %d GPIO Pin\",\"unique_id\":\"%s_cfg_pump%d_pin\","
+      "\"state_topic\":\"%s\","
+      "\"value_template\":\"{{value_json.pumpPins[%d]}}\","
+      "\"command_topic\":\"%s\",\"command_template\":\"{\\\"pumpPin%d\\\":{{value}}}\","
+      "\"min\":0,\"max\":28,\"mode\":\"box\","
+      "\"entity_category\":\"config\",%s}",
+      i + 1, UNIT_ID, i + 1,
+      CONFIG_STATE_TOPIC, i,
+      CONFIG_SET_TOPIC, i,
+      dev);
+    mqtt.publish(discPin, payload, true);
+
+    snprintf(payload, sizeof(payload),
+      "{\"name\":\"Pump %d Duration (s)\",\"unique_id\":\"%s_cfg_pump%d_dur\","
+      "\"state_topic\":\"%s\","
+      "\"value_template\":\"{{value_json.pumpDurations[%d]}}\","
+      "\"command_topic\":\"%s\",\"command_template\":\"{\\\"pumpDuration%d\\\":{{value}}}\","
+      "\"min\":1,\"max\":%d,\"mode\":\"box\","
+      "\"entity_category\":\"config\",%s}",
+      i + 1, UNIT_ID, i + 1,
+      CONFIG_STATE_TOPIC, i,
+      CONFIG_SET_TOPIC, i,
+      PUMP_MAX_DURATION_S,
+      dev);
+    mqtt.publish(discDur, payload, true);
+  }
 
   logf("MQTT      — HA discovery published\n");
 }
