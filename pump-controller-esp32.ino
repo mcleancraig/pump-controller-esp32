@@ -44,7 +44,7 @@ const int FOTA_VERSION_TIMEOUT_MS   = 8000;
 const int FOTA_DL_TIMEOUT_MS        = 60000;
 
 // ── AP credentials ────────────────────────────────────────
-const char* AP_PASSWORD = "moisture";
+const char* AP_PASSWORD = "pumpcontroller";
 
 // ── NTP ───────────────────────────────────────────────────
 const char* NTP_SERVER   = "pool.ntp.org";
@@ -101,16 +101,16 @@ void loadConfig() {
   cfg.staticIP    = prefs.getBool("staticIP", false);
 
   if (prefs.getBytes("ip",  cfg.ip,  4) == 0) {
-    cfg.ip[0] = 192; cfg.ip[1] = 168; cfg.ip[2] = 220; cfg.ip[3] = 1;
+    cfg.ip[0] = 192; cfg.ip[1] = 168; cfg.ip[2] = 211; cfg.ip[3] = 1;
   }
   if (prefs.getBytes("gw",  cfg.gw,  4) == 0) {
-    cfg.gw[0] = 192; cfg.gw[1] = 168; cfg.gw[2] =   1; cfg.gw[3] = 1;
+    cfg.gw[0] = 192; cfg.gw[1] = 168; cfg.gw[2] = 211; cfg.gw[3] = 1;
   }
   if (prefs.getBytes("sn",  cfg.sn,  4) == 0) {
-    cfg.sn[0] = 255; cfg.sn[1] = 255; cfg.sn[2] =   0; cfg.sn[3] = 0;
+    cfg.sn[0] = 255; cfg.sn[1] = 255; cfg.sn[2] = 255; cfg.sn[3] = 0;
   }
   if (prefs.getBytes("dns", cfg.dns, 4) == 0) {
-    cfg.dns[0] = 192; cfg.dns[1] = 168; cfg.dns[2] = 1; cfg.dns[3] = 1;
+    cfg.dns[0] = 192; cfg.dns[1] = 168; cfg.dns[2] = 211; cfg.dns[3] = 1;
   }
 
   prefs.getString("mqttBroker", cfg.mqttBroker,  sizeof(cfg.mqttBroker));
@@ -429,7 +429,7 @@ const char CONFIG_HTML[] PROGMEM = R"rawhtml(
         <span>.</span>
         <input type="number" name="ip2" id="ip2" value="168" min="0" max="255">
         <span>.</span>
-        <input type="number" name="ip3" id="ip3" value="220" min="0" max="255">
+        <input type="number" name="ip3" id="ip3" value="211" min="0" max="255">
         <span>.</span>
         <input type="number" name="ip4" id="ip4" min="0" max="255">
       </div>
@@ -439,7 +439,7 @@ const char CONFIG_HTML[] PROGMEM = R"rawhtml(
         <span>.</span>
         <input type="number" name="gw2" value="168" min="0" max="255">
         <span>.</span>
-        <input type="number" name="gw3" value="1" min="0" max="255">
+        <input type="number" name="gw3" value="211" min="0" max="255">
         <span>.</span>
         <input type="number" name="gw4" value="1" min="0" max="255">
       </div>
@@ -449,7 +449,7 @@ const char CONFIG_HTML[] PROGMEM = R"rawhtml(
         <span>.</span>
         <input type="number" name="sn2" value="255" min="0" max="255">
         <span>.</span>
-        <input type="number" name="sn3" value="0" min="0" max="255">
+        <input type="number" name="sn3" value="255" min="0" max="255">
         <span>.</span>
         <input type="number" name="sn4" value="0" min="0" max="255">
       </div>
@@ -459,7 +459,7 @@ const char CONFIG_HTML[] PROGMEM = R"rawhtml(
         <span>.</span>
         <input type="number" name="dns2" value="168" min="0" max="255">
         <span>.</span>
-        <input type="number" name="dns3" value="1" min="0" max="255">
+        <input type="number" name="dns3" value="211" min="0" max="255">
         <span>.</span>
         <input type="number" name="dns4" value="1" min="0" max="255">
       </div>
@@ -523,14 +523,16 @@ function syncNet() {
   document.getElementById('ip4').value = n;
 }
 function toggleNet(chk) {
-  document.getElementById('network-rows').style.display = chk.checked ? '' : 'none';
+  document.getElementById('network-rows').style.display = chk.checked ? 'block' : 'none';
 }
 function togglePw(btn) {
   var inp = btn.parentElement.querySelector('input');
   inp.type = inp.type === 'password' ? 'text' : 'password';
 }
 function updatePumpRows() {
-  var count = parseInt(document.getElementById('pumpCount').value) || 1;
+  var raw = parseInt(document.getElementById('pumpCount').value) || 1;
+  var count = Math.min(Math.max(raw, 1), 5);
+  document.getElementById('pumpCount').value = count;  // clamp visible value too
   var container = document.getElementById('pump-rows');
   container.innerHTML = '';
   for (var i = 0; i < count; i++) {
