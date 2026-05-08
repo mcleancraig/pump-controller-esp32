@@ -1273,10 +1273,15 @@ void setup() {
     return;
   }
 
+  // Start NTP immediately after WiFi — it syncs asynchronously in the background,
+  // so it accumulates time during syslogFlush() (which may block on DNS if a
+  // syslog hostname is configured; lwIP DNS retries can take 30+ seconds).
+  configTime(GMT_OFFSET_S, DST_OFFSET_S, NTP_SERVER);
+
+  logf("Syslog    — flushing\n");
   syslogFlush();
 
   // NTP
-  configTime(GMT_OFFSET_S, DST_OFFSET_S, NTP_SERVER);
   logf("NTP       — syncing\n");
   unsigned long ntpStart = millis();
   struct tm t;
