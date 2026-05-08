@@ -722,9 +722,15 @@ static PumpSlot pumpSlot[MAX_PUMPS];
 
 void stopPump(int idx) {
   if (idx < 0 || idx >= MAX_PUMPS) return;
+  bool wasRunning = pumpSlot[idx].running;
   pumpSlot[idx].running = false;
   if (idx < cfg.pumpCount) {
     digitalWrite(cfg.pumpPin[idx], LOW);
+  }
+  if (wasRunning) {
+    logf("Pump %d   — stopped (GPIO%d LOW)\n", idx + 1, cfg.pumpPin[idx]);
+  } else {
+    logf("Pump %d   — stop requested but was already idle\n", idx + 1);
   }
 }
 
@@ -796,6 +802,8 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     int pumpNumber = atoi(topic + prefixLen);   // 1-based
     int idx = pumpNumber - 1;                    // 0-based
     if (idx >= 0 && idx < cfg.pumpCount) {
+      // Serial only — no logf/syslog inside MQTT callback
+      Serial.printf("[mqttCallback] pump %d cmd: '%s'\n", idx + 1, msg);
       pendingPumpCmd.active = true;
       pendingPumpCmd.idx    = idx;
       pendingPumpCmd.water  = (strcmp(msg, "water") == 0);
@@ -1277,6 +1285,7 @@ void loop() {
     }
   } else {
     mqtt.loop();
+    mqtt.loop();  // drain up to 2 queued messages per iteration
   }
 
   // ── Process deferred pump command ─────────────────────────
