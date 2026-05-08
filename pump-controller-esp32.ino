@@ -333,13 +333,13 @@ void syslogFlush() {
     }
   }
 
-  int count = min(syslogTotal, SYSLOG_LINES);
-  int start = (syslogTotal >= SYSLOG_LINES) ? syslogHead : 0;
-  for (int i = 0; i < count; i++) {
-    int idx = (start + i) % SYSLOG_LINES;
-    syslogSend(syslogBuf[idx].func, syslogBuf[idx].msg);
-    delay(2);
-  }
+  // Discard buffered boot messages rather than sending them.
+  //
+  // WiFiUDP::endPacket() performs a synchronous ARP resolution when the ARP
+  // cache is cold (first few seconds after WiFi association).  Each blocked
+  // send takes ~4 s, so 5 buffered messages × 4 s ≈ 20 s of dead time at
+  // boot.  The buffered lines are already visible on serial; syslog picks up
+  // real-time messages from this point forward.
   syslogHead  = 0;
   syslogTotal = 0;
   syslogReady = true;
