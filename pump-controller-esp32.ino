@@ -107,7 +107,7 @@ void loadConfig() {
     cfg.gw[0] = 192; cfg.gw[1] = 168; cfg.gw[2] = 211; cfg.gw[3] = 1;
   }
   if (prefs.getBytes("sn",  cfg.sn,  4) == 0) {
-    cfg.sn[0] = 255; cfg.sn[1] = 255; cfg.sn[2] = 255; cfg.sn[3] = 0;
+    cfg.sn[0] = 255; cfg.sn[1] = 255; cfg.sn[2] = 0; cfg.sn[3] = 0;
   }
   if (prefs.getBytes("dns", cfg.dns, 4) == 0) {
     cfg.dns[0] = 192; cfg.dns[1] = 168; cfg.dns[2] = 211; cfg.dns[3] = 1;
@@ -449,7 +449,7 @@ const char CONFIG_HTML[] PROGMEM = R"rawhtml(
         <span>.</span>
         <input type="number" name="sn2" value="255" min="0" max="255">
         <span>.</span>
-        <input type="number" name="sn3" value="255" min="0" max="255">
+        <input type="number" name="sn3" value="0" min="0" max="255">
         <span>.</span>
         <input type="number" name="sn4" value="0" min="0" max="255">
       </div>
