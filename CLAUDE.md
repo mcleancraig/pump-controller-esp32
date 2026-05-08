@@ -38,3 +38,24 @@ cd /Users/craig/git/pump-controller-esp32 && git status
 
 For non-git commands that genuinely require a working directory (e.g. arduino-cli
 compile, `gh` commands), `cd` is still fine — the prompt only fires for `cd && git`.
+
+## Arduino compile / upload
+
+The Waveshare ESP32-C6-Zero uses native USB CDC for serial. Always include
+`CDCOnBoot=cdc` in the FQBN or serial output will be silently routed to UART0
+(not connected to USB) and nothing will appear on the monitor.
+
+**Compile:**
+```
+arduino-cli compile \
+  --fqbn esp32:esp32:esp32c6:CDCOnBoot=cdc \
+  --output-dir /tmp/pump-build \
+  pump-controller-esp32.ino
+```
+
+**Upload:**
+```
+arduino-cli upload -p /dev/cu.usbmodem* \
+  --fqbn esp32:esp32:esp32c6:CDCOnBoot=cdc \
+  /tmp/pump-build/pump-controller-esp32.ino.bin
+```
