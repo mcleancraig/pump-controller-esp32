@@ -12,6 +12,11 @@
 
 // ═══════════════════════════════════════════════════════════
 //  v0.1.0
+//  - NVS magic key: loadConfig() checks for "pump-ctrl-1" magic in the
+//    "pump" namespace; if absent or wrong (stale NVS from a different
+//    firmware), namespace is cleared and device falls through to portal.
+//    Stricter than moisture sensor — no deployed devices to be backwards
+//    compatible with, so missing magic is treated as stale.
 //  - Initial release: configurable N pumps (1-5), always-awake loop,
 //    MQTT command/state per pump, WiFi+captive portal, syslog,
 //    HA MQTT autodiscovery, FOTA, NTP, NVS config
@@ -90,10 +95,32 @@ struct Config {
 
 bool configLoaded = false;
 
+// NVS magic — identifies config written by this firmware.
+// Absent or wrong → clear namespace and return (configLoaded stays false → portal).
+// Stricter than moisture sensor: no deployed devices, so any non-matching value
+// (including absent) is treated as stale and cleared.
+const char* NVS_MAGIC_KEY   = "magic";
+const char* NVS_MAGIC_VALUE = "pump-ctrl-1";
+
 // Forward-declare _logf so logf macro compiles before first use
 #define logf(fmt, ...) _logf(__func__, fmt, ##__VA_ARGS__)
 
 void loadConfig() {
+  prefs.begin("pump", true);
+  String magic = prefs.getString(NVS_MAGIC_KEY, "");
+  prefs.end();
+  if (magic != NVS_MAGIC_VALUE) {
+    if (magic.length() > 0) {
+      logf("Config    — NVS magic mismatch ('%s'), clearing\n", magic.c_str());
+    } else {
+      logf("Config    — NVS magic absent, clearing\n");
+    }
+    prefs.begin("pump", false);
+    prefs.clear();
+    prefs.end();
+    return;  // configLoaded = false → portal
+  }
+
   prefs.begin("pump", true);
   cfg.unitNumber  = prefs.getInt("unitNum", 0);
   prefs.getString("wifiSSID",   cfg.wifiSSID,    sizeof(cfg.wifiSSID));
@@ -149,6 +176,7 @@ void clearConfig() {
 
 void saveConfig(const Config& c) {
   prefs.begin("pump", false);
+  prefs.putString(NVS_MAGIC_KEY, NVS_MAGIC_VALUE);
   prefs.putInt("unitNum",        c.unitNumber);
   prefs.putString("wifiSSID",    c.wifiSSID);
   prefs.putString("wifiPass",    c.wifiPassword);
