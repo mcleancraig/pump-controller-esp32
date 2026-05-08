@@ -39,6 +39,7 @@ const int WIFI_TIMEOUT_MS           = 15000;
 const int MQTT_TIMEOUT_S            = 5;
 const unsigned long MQTT_RECONNECT_COOLDOWN_MS = 5000;
 const unsigned long HEARTBEAT_INTERVAL_MS      = 30000;
+const unsigned long FOTA_CHECK_INTERVAL_MS     = 3600000UL;  // 1 hour
 const int NTP_TIMEOUT_MS            = 10000;
 const int FOTA_VERSION_TIMEOUT_MS   = 8000;
 const int FOTA_DL_TIMEOUT_MS        = 60000;
@@ -1226,6 +1227,7 @@ void setup() {
 
 static unsigned long lastHeartbeat   = 0;
 static unsigned long lastMqttAttempt = 0;
+static unsigned long lastFotaCheck   = 0;  // 0 = checked on boot via setup()
 
 void loop() {
   // ── MQTT reconnect with cooldown ──────────────────────────
@@ -1267,6 +1269,17 @@ void loop() {
   if (mqtt.connected() && millis() - lastHeartbeat >= HEARTBEAT_INTERVAL_MS) {
     lastHeartbeat = millis();
     publishUnitState();
+  }
+
+  // ── Periodic FOTA check (hourly) ──────────────────────────
+  // Skip if any pump is running — don't interrupt an active water cycle.
+  if (millis() - lastFotaCheck >= FOTA_CHECK_INTERVAL_MS) {
+    bool anyRunning = false;
+    for (int i = 0; i < cfg.pumpCount; i++) anyRunning |= pumpSlot[i].running;
+    if (!anyRunning) {
+      lastFotaCheck = millis();
+      checkForUpdate();  // reboots on successful update; returns if already up to date
+    }
   }
 
   // ── Deferred config update ────────────────────────────────
