@@ -1273,26 +1273,33 @@ void setup() {
     return;
   }
 
-  // Start NTP immediately after WiFi — it syncs asynchronously in the background,
-  // so it accumulates time during syslogFlush() (which may block on DNS if a
-  // syslog hostname is configured; lwIP DNS retries can take 30+ seconds).
+  // NTP — sync before opening syslog so buffered messages get real timestamps.
+  // Matches moisture-sensor pattern: NTP first, syslogFlush after.
+  // No syslog UDP activity during the wait, so lwIP can service SNTP freely.
   configTime(GMT_OFFSET_S, DST_OFFSET_S, NTP_SERVER);
+  logf("NTP       — syncing\n");
+  {
+    struct tm t;
+    unsigned long ntpStart = millis();
+    while (!getLocalTime(&t)) {
+      if (millis() - ntpStart >= NTP_TIMEOUT_MS) {
+        logf("NTP       — timed out, timestamps will be approximate\n");
+        break;
+      }
+      delay(500);
+    }
+    if (getLocalTime(&t)) {
+      logf("NTP       — %04d-%02d-%02dT%02d:%02d:%02dZ\n",
+        t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+        t.tm_hour, t.tm_min, t.tm_sec);
+    }
+  }
 
+  // Bind UDP socket before first send, then flush buffered boot messages.
+  // (Mirrors moisture-sensor: syslogUdp.begin(0) → syslogFlush)
+  syslogUdp.begin(0);
   logf("Syslog    — flushing\n");
   syslogFlush();
-
-  // NTP
-  logf("NTP       — syncing\n");
-  unsigned long ntpStart = millis();
-  struct tm t;
-  while (!getLocalTime(&t) && millis() - ntpStart < NTP_TIMEOUT_MS) delay(200);
-  if (getLocalTime(&t)) {
-    char ts[32];
-    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &t);
-    logf("NTP       — %s\n", ts);
-  } else {
-    logf("NTP       — sync timeout\n");
-  }
 
   // FOTA check (once per boot)
   checkForUpdate();
