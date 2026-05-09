@@ -11,6 +11,14 @@
 #include "esp_mac.h"
 
 // ═══════════════════════════════════════════════════════════
+//  v0.2.0
+//  - Water level sensor: NO reed switch + float/magnet detects when the
+//    water supply is running low. Reed open (HIGH on INPUT_PULLUP) = low
+//    water. Configurable GPIO pin (waterLevelPin, default -1 = disabled).
+//    2-second hardware debounce. Publishes a HA binary_sensor (device_class
+//    problem) and logs a "Water LOW" alert on transition. Pin settable via
+//    the captive portal and via HA config entity without reflashing.
+//
 //  v0.1.0
 //  - NVS magic key: loadConfig() checks for "pump-ctrl-1" magic in the
 //    "pump" namespace; if absent or wrong (stale NVS from a different
@@ -26,7 +34,7 @@
 // ═══════════════════════════════════════════════════════════
 
 // Dev builds: update SHA suffix with `git rev-parse --short HEAD` after each commit.
-#define FIRMWARE_VERSION "0.1.0"
+#define FIRMWARE_VERSION "0.2.0-dev.8a80e65"
 
 // ── Hardware constants ────────────────────────────────────
 const int BTN_BOOT  = 9;      // Boot button — GPIO9 on Waveshare C6-Zero / XIAO C6
@@ -45,6 +53,7 @@ const int MQTT_TIMEOUT_S            = 5;
 const unsigned long MQTT_RECONNECT_COOLDOWN_MS = 5000;
 const unsigned long HEARTBEAT_INTERVAL_MS      = 30000;
 const unsigned long FOTA_CHECK_INTERVAL_MS     = 3600000UL;  // 1 hour
+const unsigned long WATER_DEBOUNCE_MS          = 2000;       // reed switch debounce
 const int NTP_TIMEOUT_MS            = 10000;
 const int FOTA_VERSION_TIMEOUT_MS   = 8000;
 const int FOTA_DL_TIMEOUT_MS        = 60000;
@@ -92,6 +101,7 @@ struct Config {
   int     pumpCount;                    // 1-MAX_PUMPS, default 1
   int     pumpPin[MAX_PUMPS];           // GPIO pin for each pump
   int     pumpDuration[MAX_PUMPS];      // seconds to run on "water" command
+  int     waterLevelPin;                // GPIO for NO reed switch; -1 = disabled
 } cfg;
 
 bool configLoaded = false;
@@ -160,6 +170,7 @@ void loadConfig() {
     cfg.pumpPin[i]      = prefs.getInt(keyPin, DEFAULT_PUMP_PINS[i]);
     cfg.pumpDuration[i] = prefs.getInt(keyDur, 5);
   }
+  cfg.waterLevelPin = prefs.getInt("waterPin", -1);
 
   prefs.end();
 
@@ -200,6 +211,7 @@ void saveConfig(const Config& c) {
     prefs.putInt(keyPin, c.pumpPin[i]);
     prefs.putInt(keyDur, c.pumpDuration[i]);
   }
+  prefs.putInt("waterPin", c.waterLevelPin);
   prefs.end();
   logf("Config    — saved to NVS\n");
 }
@@ -240,6 +252,10 @@ char DISC_CFG_MQTT_PASS[128];
 char DISC_CFG_SYSLOG_HOST[128];
 char DISC_CFG_SYSLOG_PORT[128];
 char DISC_CFG_PUMP_COUNT[128];
+// Water level sensor
+char WATER_LEVEL_TOPIC[64];
+char DISC_WATER_LEVEL[128];
+char DISC_CFG_WATER_PIN[128];
 // Network config discovery topics
 char DISC_CFG_STATIC_IP[128];
 char DISC_CFG_IP[128];
@@ -277,6 +293,13 @@ void buildDerivedConfig() {
     "%s/number/%s_cfg_syslog_port/config", HA_DISCOVERY_PREFIX, UNIT_ID);
   snprintf(DISC_CFG_PUMP_COUNT,   sizeof(DISC_CFG_PUMP_COUNT),
     "%s/number/%s_cfg_pump_count/config",  HA_DISCOVERY_PREFIX, UNIT_ID);
+
+  snprintf(WATER_LEVEL_TOPIC,    sizeof(WATER_LEVEL_TOPIC),
+    "garden/%s/water_level",               UNIT_ID);
+  snprintf(DISC_WATER_LEVEL,     sizeof(DISC_WATER_LEVEL),
+    "%s/binary_sensor/%s_water_level/config", HA_DISCOVERY_PREFIX, UNIT_ID);
+  snprintf(DISC_CFG_WATER_PIN,   sizeof(DISC_CFG_WATER_PIN),
+    "%s/number/%s_cfg_water_pin/config",   HA_DISCOVERY_PREFIX, UNIT_ID);
 
   snprintf(DISC_CFG_STATIC_IP,   sizeof(DISC_CFG_STATIC_IP),
     "%s/switch/%s_cfg_static_ip/config",   HA_DISCOVERY_PREFIX, UNIT_ID);
@@ -560,6 +583,16 @@ const char CONFIG_HTML[] PROGMEM = R"rawhtml(
     </details>
   </div>
 
+  <div class="section">
+    <details>
+      <summary>Water level sensor <span class="optional">(optional)</span></summary>
+      <label style="margin-top:12px">Reed switch GPIO pin
+        <input type="number" name="waterPin" value="-1" min="-1" max="28">
+      </label>
+      <p class="hint">Normally-open reed switch with float and magnet. Reed closes (LOW) when water is present; opens (HIGH) when the tank runs low. Set to -1 to disable.</p>
+    </details>
+  </div>
+
   <button type="submit">Save &amp; Restart</button>
 </form>
 
@@ -680,6 +713,9 @@ void handleSave() {
     c.pumpPin[i]      = (pin >= 0 && pin <= 28) ? pin : DEFAULT_PUMP_PINS[i];
     c.pumpDuration[i] = (dur >= 1 && dur <= PUMP_MAX_DURATION_S) ? dur : 5;
   }
+
+  int waterPin = server.hasArg("waterPin") ? server.arg("waterPin").toInt() : -1;
+  c.waterLevelPin = (waterPin >= -1 && waterPin <= 28) ? waterPin : -1;
 
   saveConfig(c);
   server.send(200, "text/html",
@@ -864,6 +900,38 @@ void publishPumpState(int idx) {
   mqtt.publish(topic, state, true);  // retained so HA picks it up on subscribe
 }
 
+// ── Water level sensor state ──────────────────────────────
+// NO reed switch: float up + magnet → reed closed → INPUT_PULLUP reads LOW = OK.
+// Float drops (low water) → magnet away → reed opens → reads HIGH = LOW water.
+static bool waterLevelLow     = false;  // current debounced state
+static int  waterLevelPinLast = -2;     // last raw read (-2 = uninitialised)
+static unsigned long waterLevelStableMs = 0;
+
+void publishWaterLevel() {
+  if (cfg.waterLevelPin < 0) return;
+  mqtt.publish(WATER_LEVEL_TOPIC, waterLevelLow ? "LOW" : "OK", true);
+}
+
+void updateWaterLevel() {
+  if (cfg.waterLevelPin < 0) return;
+  int raw = digitalRead(cfg.waterLevelPin);   // HIGH = reed open = water low
+  if (raw != waterLevelPinLast) {
+    waterLevelPinLast = raw;
+    waterLevelStableMs = millis();
+    return;  // restart debounce timer
+  }
+  if (millis() - waterLevelStableMs < WATER_DEBOUNCE_MS) return;  // still settling
+  bool nowLow = (raw == HIGH);
+  if (nowLow == waterLevelLow) return;  // no change
+  waterLevelLow = nowLow;
+  if (waterLevelLow) {
+    logf("Water     — LOW (reed open, GPIO%d HIGH)\n", cfg.waterLevelPin);
+  } else {
+    logf("Water     — OK (reed closed, GPIO%d LOW)\n", cfg.waterLevelPin);
+  }
+  if (mqtt.connected()) publishWaterLevel();
+}
+
 void publishUnitState() {
   unsigned long uptimeSec = millis() / 1000;
   char payload[200];
@@ -896,11 +964,13 @@ void publishConfigState() {
     "\"mqttPassword\":\"***\","
     "\"syslogHost\":\"%s\",\"syslogPort\":%d,"
     "\"pumpCount\":%d,\"pumpPins\":%s,\"pumpDurations\":%s,"
-    "\"staticIP\":%s,\"ip\":\"%s\",\"gw\":\"%s\",\"sn\":\"%s\",\"dns\":\"%s\"}",
+    "\"staticIP\":%s,\"ip\":\"%s\",\"gw\":\"%s\",\"sn\":\"%s\",\"dns\":\"%s\","
+    "\"waterLevelPin\":%d}",
     cfg.mqttBroker, cfg.mqttPort, cfg.mqttUser,
     cfg.syslogHost, cfg.syslogPort,
     cfg.pumpCount, pins, durs,
-    cfg.staticIP ? "true" : "false", ipStr, gwStr, snStr, dnsStr);
+    cfg.staticIP ? "true" : "false", ipStr, gwStr, snStr, dnsStr,
+    cfg.waterLevelPin);
   mqtt.publish(CONFIG_STATE_TOPIC, payload, true);
 }
 
@@ -961,6 +1031,7 @@ void applyConfigUpdate(const char* json) {
   if (extractStr(json, "gw",  tmp, sizeof(tmp))) parseIP(tmp, cfg.gw);
   if (extractStr(json, "sn",  tmp, sizeof(tmp))) parseIP(tmp, cfg.sn);
   if (extractStr(json, "dns", tmp, sizeof(tmp))) parseIP(tmp, cfg.dns);
+  if (extractInt(json, "waterLevelPin", &ival) && ival >= -1 && ival <= 28) cfg.waterLevelPin = ival;
 
   for (int i = 0; i < MAX_PUMPS; i++) {
     char keyPin[24], keyDur[24];
@@ -1151,6 +1222,34 @@ void publishHADiscovery() {
     mqtt.publish(discDur, payload, true);
   }
 
+  // ── Water level sensor ────────────────────────────────────
+  // Binary sensor — ON (problem) = water low, OFF = OK.
+  // Published only when a pin is configured; cleared (empty retained) when disabled.
+  if (cfg.waterLevelPin >= 0) {
+    snprintf(payload, sizeof(payload),
+      "{\"name\":\"Water Level\",\"unique_id\":\"%s_water_level\","
+      "\"state_topic\":\"%s\","
+      "\"payload_on\":\"LOW\",\"payload_off\":\"OK\","
+      "\"device_class\":\"problem\","
+      "\"icon\":\"mdi:water-alert\",%s}",
+      UNIT_ID, WATER_LEVEL_TOPIC, dev);
+  } else {
+    payload[0] = '\0';  // empty payload un-publishes any previous retained entity
+  }
+  mqtt.publish(DISC_WATER_LEVEL, payload, true);
+
+  // Config: water level pin (-1 = disabled, 0-28 = GPIO)
+  snprintf(payload, sizeof(payload),
+    "{\"name\":\"Water Level Pin\",\"unique_id\":\"%s_cfg_water_pin\","
+    "\"state_topic\":\"%s\","
+    "\"value_template\":\"{{value_json.waterLevelPin}}\","
+    "\"command_topic\":\"%s\",\"command_template\":\"{\\\"waterLevelPin\\\":{{value}}}\","
+    "\"min\":-1,\"max\":28,\"mode\":\"box\","
+    "\"icon\":\"mdi:electric-switch\","
+    "\"entity_category\":\"config\",%s}",
+    UNIT_ID, CONFIG_STATE_TOPIC, CONFIG_SET_TOPIC, dev);
+  mqtt.publish(DISC_CFG_WATER_PIN, payload, true);
+
   // ── Network config ────────────────────────────────────────
   // Static IP switch — payload_on/off are raw JSON sent to config/set topic
   snprintf(payload, sizeof(payload),
@@ -1226,6 +1325,7 @@ bool mqttConnect() {
   publishConfigState();
   publishUnitState();
   for (int i = 0; i < cfg.pumpCount; i++) publishPumpState(i);
+  publishWaterLevel();
 
   return true;
 }
@@ -1341,6 +1441,18 @@ void setup() {
 
   buildDerivedConfig();
   initPumpPins();
+
+  // Water level reed switch — INPUT_PULLUP; take an initial reading so
+  // the debounce state is seeded and the first publish reflects reality.
+  if (cfg.waterLevelPin >= 0) {
+    pinMode(cfg.waterLevelPin, INPUT_PULLUP);
+    waterLevelPinLast = digitalRead(cfg.waterLevelPin);
+    waterLevelStableMs = millis();
+    waterLevelLow = (waterLevelPinLast == HIGH);
+    logf("Water     — pin GPIO%d, initial state: %s\n",
+      cfg.waterLevelPin, waterLevelLow ? "LOW" : "OK");
+  }
+
   checkBootButton();
 
   if (!connectWiFi()) {
@@ -1448,6 +1560,9 @@ void loop() {
     lastHeartbeat = millis();
     publishUnitState();
   }
+
+  // ── Water level sensor ────────────────────────────────────
+  updateWaterLevel();
 
   // ── Periodic FOTA check (hourly) ──────────────────────────
   // Skip if any pump is running — don't interrupt an active water cycle.
