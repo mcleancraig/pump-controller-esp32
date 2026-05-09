@@ -12,6 +12,11 @@
 
 // ═══════════════════════════════════════════════════════════
 //  v0.1.0
+//  - NVS magic key: loadConfig() checks for "pump-ctrl-1" magic in the
+//    "pump" namespace; if absent or wrong (stale NVS from a different
+//    firmware), namespace is cleared and device falls through to portal.
+//    Stricter than moisture sensor — no deployed devices to be backwards
+//    compatible with, so missing magic is treated as stale.
 //  - Initial release: configurable N pumps (1-5), always-awake loop,
 //    MQTT command/state per pump, WiFi+captive portal, syslog,
 //    HA MQTT autodiscovery, FOTA, NTP, NVS config
@@ -21,7 +26,7 @@
 // ═══════════════════════════════════════════════════════════
 
 // Dev builds: update SHA suffix with `git rev-parse --short HEAD` after each commit.
-#define FIRMWARE_VERSION "0.1.0-dev.139cc62"
+#define FIRMWARE_VERSION "0.1.0"
 
 // ── Hardware constants ────────────────────────────────────
 const int BTN_BOOT  = 9;      // Boot button — GPIO9 on Waveshare C6-Zero / XIAO C6
@@ -39,12 +44,13 @@ const int WIFI_TIMEOUT_MS           = 15000;
 const int MQTT_TIMEOUT_S            = 5;
 const unsigned long MQTT_RECONNECT_COOLDOWN_MS = 5000;
 const unsigned long HEARTBEAT_INTERVAL_MS      = 30000;
+const unsigned long FOTA_CHECK_INTERVAL_MS     = 3600000UL;  // 1 hour
 const int NTP_TIMEOUT_MS            = 10000;
 const int FOTA_VERSION_TIMEOUT_MS   = 8000;
 const int FOTA_DL_TIMEOUT_MS        = 60000;
 
 // ── AP credentials ────────────────────────────────────────
-const char* AP_PASSWORD = "moisture";
+const char* AP_PASSWORD = "pumpcontroller";
 
 // ── NTP ───────────────────────────────────────────────────
 const char* NTP_SERVER   = "pool.ntp.org";
@@ -90,10 +96,32 @@ struct Config {
 
 bool configLoaded = false;
 
+// NVS magic — identifies config written by this firmware.
+// Absent or wrong → clear namespace and return (configLoaded stays false → portal).
+// Stricter than moisture sensor: no deployed devices, so any non-matching value
+// (including absent) is treated as stale and cleared.
+const char* NVS_MAGIC_KEY   = "magic";
+const char* NVS_MAGIC_VALUE = "pump-ctrl-1";
+
 // Forward-declare _logf so logf macro compiles before first use
 #define logf(fmt, ...) _logf(__func__, fmt, ##__VA_ARGS__)
 
 void loadConfig() {
+  prefs.begin("pump", true);
+  String magic = prefs.getString(NVS_MAGIC_KEY, "");
+  prefs.end();
+  if (magic != NVS_MAGIC_VALUE) {
+    if (magic.length() > 0) {
+      logf("Config    — NVS magic mismatch ('%s'), clearing\n", magic.c_str());
+    } else {
+      logf("Config    — NVS magic absent, clearing\n");
+    }
+    prefs.begin("pump", false);
+    prefs.clear();
+    prefs.end();
+    return;  // configLoaded = false → portal
+  }
+
   prefs.begin("pump", true);
   cfg.unitNumber  = prefs.getInt("unitNum", 0);
   prefs.getString("wifiSSID",   cfg.wifiSSID,    sizeof(cfg.wifiSSID));
@@ -101,16 +129,16 @@ void loadConfig() {
   cfg.staticIP    = prefs.getBool("staticIP", false);
 
   if (prefs.getBytes("ip",  cfg.ip,  4) == 0) {
-    cfg.ip[0] = 192; cfg.ip[1] = 168; cfg.ip[2] = 220; cfg.ip[3] = 1;
+    cfg.ip[0] = 192; cfg.ip[1] = 168; cfg.ip[2] = 211; cfg.ip[3] = 1;
   }
   if (prefs.getBytes("gw",  cfg.gw,  4) == 0) {
-    cfg.gw[0] = 192; cfg.gw[1] = 168; cfg.gw[2] =   1; cfg.gw[3] = 1;
+    cfg.gw[0] = 192; cfg.gw[1] = 168; cfg.gw[2] = 211; cfg.gw[3] = 1;
   }
   if (prefs.getBytes("sn",  cfg.sn,  4) == 0) {
-    cfg.sn[0] = 255; cfg.sn[1] = 255; cfg.sn[2] =   0; cfg.sn[3] = 0;
+    cfg.sn[0] = 255; cfg.sn[1] = 255; cfg.sn[2] = 0; cfg.sn[3] = 0;
   }
   if (prefs.getBytes("dns", cfg.dns, 4) == 0) {
-    cfg.dns[0] = 192; cfg.dns[1] = 168; cfg.dns[2] = 1; cfg.dns[3] = 1;
+    cfg.dns[0] = 192; cfg.dns[1] = 168; cfg.dns[2] = 211; cfg.dns[3] = 1;
   }
 
   prefs.getString("mqttBroker", cfg.mqttBroker,  sizeof(cfg.mqttBroker));
@@ -149,6 +177,7 @@ void clearConfig() {
 
 void saveConfig(const Config& c) {
   prefs.begin("pump", false);
+  prefs.putString(NVS_MAGIC_KEY, NVS_MAGIC_VALUE);
   prefs.putInt("unitNum",        c.unitNumber);
   prefs.putString("wifiSSID",    c.wifiSSID);
   prefs.putString("wifiPass",    c.wifiPassword);
@@ -211,6 +240,12 @@ char DISC_CFG_MQTT_PASS[128];
 char DISC_CFG_SYSLOG_HOST[128];
 char DISC_CFG_SYSLOG_PORT[128];
 char DISC_CFG_PUMP_COUNT[128];
+// Network config discovery topics
+char DISC_CFG_STATIC_IP[128];
+char DISC_CFG_IP[128];
+char DISC_CFG_GW[128];
+char DISC_CFG_SN[128];
+char DISC_CFG_DNS[128];
 
 void buildDerivedConfig() {
   snprintf(UNIT_ID,            sizeof(UNIT_ID),            "pump%d",                    cfg.unitNumber);
@@ -242,6 +277,17 @@ void buildDerivedConfig() {
     "%s/number/%s_cfg_syslog_port/config", HA_DISCOVERY_PREFIX, UNIT_ID);
   snprintf(DISC_CFG_PUMP_COUNT,   sizeof(DISC_CFG_PUMP_COUNT),
     "%s/number/%s_cfg_pump_count/config",  HA_DISCOVERY_PREFIX, UNIT_ID);
+
+  snprintf(DISC_CFG_STATIC_IP,   sizeof(DISC_CFG_STATIC_IP),
+    "%s/switch/%s_cfg_static_ip/config",   HA_DISCOVERY_PREFIX, UNIT_ID);
+  snprintf(DISC_CFG_IP,          sizeof(DISC_CFG_IP),
+    "%s/text/%s_cfg_ip/config",            HA_DISCOVERY_PREFIX, UNIT_ID);
+  snprintf(DISC_CFG_GW,          sizeof(DISC_CFG_GW),
+    "%s/text/%s_cfg_gw/config",            HA_DISCOVERY_PREFIX, UNIT_ID);
+  snprintf(DISC_CFG_SN,          sizeof(DISC_CFG_SN),
+    "%s/text/%s_cfg_sn/config",            HA_DISCOVERY_PREFIX, UNIT_ID);
+  snprintf(DISC_CFG_DNS,         sizeof(DISC_CFG_DNS),
+    "%s/text/%s_cfg_dns/config",           HA_DISCOVERY_PREFIX, UNIT_ID);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -304,13 +350,13 @@ void syslogFlush() {
     }
   }
 
-  int count = min(syslogTotal, SYSLOG_LINES);
-  int start = (syslogTotal >= SYSLOG_LINES) ? syslogHead : 0;
-  for (int i = 0; i < count; i++) {
-    int idx = (start + i) % SYSLOG_LINES;
-    syslogSend(syslogBuf[idx].func, syslogBuf[idx].msg);
-    delay(2);
-  }
+  // Discard buffered boot messages rather than sending them.
+  //
+  // WiFiUDP::endPacket() performs a synchronous ARP resolution when the ARP
+  // cache is cold (first few seconds after WiFi association).  Each blocked
+  // send takes ~4 s, so 5 buffered messages × 4 s ≈ 20 s of dead time at
+  // boot.  The buffered lines are already visible on serial; syslog picks up
+  // real-time messages from this point forward.
   syslogHead  = 0;
   syslogTotal = 0;
   syslogReady = true;
@@ -429,7 +475,7 @@ const char CONFIG_HTML[] PROGMEM = R"rawhtml(
         <span>.</span>
         <input type="number" name="ip2" id="ip2" value="168" min="0" max="255">
         <span>.</span>
-        <input type="number" name="ip3" id="ip3" value="220" min="0" max="255">
+        <input type="number" name="ip3" id="ip3" value="211" min="0" max="255">
         <span>.</span>
         <input type="number" name="ip4" id="ip4" min="0" max="255">
       </div>
@@ -439,7 +485,7 @@ const char CONFIG_HTML[] PROGMEM = R"rawhtml(
         <span>.</span>
         <input type="number" name="gw2" value="168" min="0" max="255">
         <span>.</span>
-        <input type="number" name="gw3" value="1" min="0" max="255">
+        <input type="number" name="gw3" value="211" min="0" max="255">
         <span>.</span>
         <input type="number" name="gw4" value="1" min="0" max="255">
       </div>
@@ -459,7 +505,7 @@ const char CONFIG_HTML[] PROGMEM = R"rawhtml(
         <span>.</span>
         <input type="number" name="dns2" value="168" min="0" max="255">
         <span>.</span>
-        <input type="number" name="dns3" value="1" min="0" max="255">
+        <input type="number" name="dns3" value="211" min="0" max="255">
         <span>.</span>
         <input type="number" name="dns4" value="1" min="0" max="255">
       </div>
@@ -523,14 +569,16 @@ function syncNet() {
   document.getElementById('ip4').value = n;
 }
 function toggleNet(chk) {
-  document.getElementById('network-rows').style.display = chk.checked ? '' : 'none';
+  document.getElementById('network-rows').style.display = chk.checked ? 'block' : 'none';
 }
 function togglePw(btn) {
   var inp = btn.parentElement.querySelector('input');
   inp.type = inp.type === 'password' ? 'text' : 'password';
 }
 function updatePumpRows() {
-  var count = parseInt(document.getElementById('pumpCount').value) || 1;
+  var raw = parseInt(document.getElementById('pumpCount').value) || 1;
+  var count = Math.min(Math.max(raw, 1), 5);
+  document.getElementById('pumpCount').value = count;  // clamp visible value too
   var container = document.getElementById('pump-rows');
   container.innerHTML = '';
   for (var i = 0; i < count; i++) {
@@ -720,9 +768,15 @@ static PumpSlot pumpSlot[MAX_PUMPS];
 
 void stopPump(int idx) {
   if (idx < 0 || idx >= MAX_PUMPS) return;
+  bool wasRunning = pumpSlot[idx].running;
   pumpSlot[idx].running = false;
   if (idx < cfg.pumpCount) {
     digitalWrite(cfg.pumpPin[idx], LOW);
+  }
+  if (wasRunning) {
+    logf("Pump %d   — stopped (GPIO%d LOW)\n", idx + 1, cfg.pumpPin[idx]);
+  } else {
+    logf("Pump %d   — stop requested but was already idle\n", idx + 1);
   }
 }
 
@@ -794,6 +848,8 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     int pumpNumber = atoi(topic + prefixLen);   // 1-based
     int idx = pumpNumber - 1;                    // 0-based
     if (idx >= 0 && idx < cfg.pumpCount) {
+      // Serial only — no logf/syslog inside MQTT callback
+      Serial.printf("[mqttCallback] pump %d cmd: '%s'\n", idx + 1, msg);
       pendingPumpCmd.active = true;
       pendingPumpCmd.idx    = idx;
       pendingPumpCmd.water  = (strcmp(msg, "water") == 0);
@@ -828,14 +884,23 @@ void publishConfigState() {
     snprintf(tmp, sizeof(tmp), "%d%s", cfg.pumpDuration[i], i < MAX_PUMPS-1 ? "," : "]");
     strlcat(durs, tmp, sizeof(durs));
   }
-  char payload[400];
+  char ipStr[16], gwStr[16], snStr[16], dnsStr[16];
+  snprintf(ipStr,  sizeof(ipStr),  "%d.%d.%d.%d", cfg.ip[0],  cfg.ip[1],  cfg.ip[2],  cfg.ip[3]);
+  snprintf(gwStr,  sizeof(gwStr),  "%d.%d.%d.%d", cfg.gw[0],  cfg.gw[1],  cfg.gw[2],  cfg.gw[3]);
+  snprintf(snStr,  sizeof(snStr),  "%d.%d.%d.%d", cfg.sn[0],  cfg.sn[1],  cfg.sn[2],  cfg.sn[3]);
+  snprintf(dnsStr, sizeof(dnsStr), "%d.%d.%d.%d", cfg.dns[0], cfg.dns[1], cfg.dns[2], cfg.dns[3]);
+
+  char payload[512];
   snprintf(payload, sizeof(payload),
     "{\"mqttBroker\":\"%s\",\"mqttPort\":%d,\"mqttUser\":\"%s\","
+    "\"mqttPassword\":\"***\","
     "\"syslogHost\":\"%s\",\"syslogPort\":%d,"
-    "\"pumpCount\":%d,\"pumpPins\":%s,\"pumpDurations\":%s}",
+    "\"pumpCount\":%d,\"pumpPins\":%s,\"pumpDurations\":%s,"
+    "\"staticIP\":%s,\"ip\":\"%s\",\"gw\":\"%s\",\"sn\":\"%s\",\"dns\":\"%s\"}",
     cfg.mqttBroker, cfg.mqttPort, cfg.mqttUser,
     cfg.syslogHost, cfg.syslogPort,
-    cfg.pumpCount, pins, durs);
+    cfg.pumpCount, pins, durs,
+    cfg.staticIP ? "true" : "false", ipStr, gwStr, snStr, dnsStr);
   mqtt.publish(CONFIG_STATE_TOPIC, payload, true);
 }
 
@@ -870,6 +935,14 @@ void applyConfigUpdate(const char* json) {
     return true;
   };
 
+  // Helper: parse a dotted IPv4 string into a 4-byte array
+  auto parseIP = [](const char* str, uint8_t* bytes) -> bool {
+    IPAddress addr;
+    if (!addr.fromString(str)) return false;
+    bytes[0] = addr[0]; bytes[1] = addr[1]; bytes[2] = addr[2]; bytes[3] = addr[3];
+    return true;
+  };
+
   char tmp[64];
   int  ival;
 
@@ -880,6 +953,14 @@ void applyConfigUpdate(const char* json) {
   if (extractStr(json, "syslogHost",   tmp, sizeof(tmp))) strlcpy(cfg.syslogHost,   tmp, sizeof(cfg.syslogHost));
   if (extractInt(json, "syslogPort",   &ival) && isValidPort(ival)) cfg.syslogPort = ival;
   if (extractInt(json, "pumpCount",    &ival) && ival >= 1 && ival <= MAX_PUMPS) cfg.pumpCount = ival;
+
+  // Network / static IP
+  if (strstr(json, "\"staticIP\":true"))  cfg.staticIP = true;
+  if (strstr(json, "\"staticIP\":false")) cfg.staticIP = false;
+  if (extractStr(json, "ip",  tmp, sizeof(tmp))) parseIP(tmp, cfg.ip);
+  if (extractStr(json, "gw",  tmp, sizeof(tmp))) parseIP(tmp, cfg.gw);
+  if (extractStr(json, "sn",  tmp, sizeof(tmp))) parseIP(tmp, cfg.sn);
+  if (extractStr(json, "dns", tmp, sizeof(tmp))) parseIP(tmp, cfg.dns);
 
   for (int i = 0; i < MAX_PUMPS; i++) {
     char keyPin[24], keyDur[24];
@@ -910,7 +991,7 @@ void publishHADiscovery() {
     "\"sw_version\":\"%s\"}",
     UNIT_ID, UNIT_NAME, FIRMWARE_VERSION);
 
-  char payload[512];
+  char payload[768];
 
   // ── Firmware version sensor ───────────────────────────────
   snprintf(payload, sizeof(payload),
@@ -1033,6 +1114,77 @@ void publishHADiscovery() {
     "\"entity_category\":\"config\",%s}",
     UNIT_ID, CONFIG_STATE_TOPIC, CONFIG_SET_TOPIC, dev);
   mqtt.publish(DISC_CFG_PUMP_COUNT, payload, true);
+
+  // ── Config: per-pump GPIO pin and duration ────────────────
+  for (int i = 0; i < cfg.pumpCount; i++) {
+    char discPin[128], discDur[128];
+    snprintf(discPin, sizeof(discPin),
+      "%s/number/%s_cfg_pump%d_pin/config", HA_DISCOVERY_PREFIX, UNIT_ID, i + 1);
+    snprintf(discDur, sizeof(discDur),
+      "%s/number/%s_cfg_pump%d_dur/config", HA_DISCOVERY_PREFIX, UNIT_ID, i + 1);
+
+    snprintf(payload, sizeof(payload),
+      "{\"name\":\"Pump %d GPIO Pin\",\"unique_id\":\"%s_cfg_pump%d_pin\","
+      "\"state_topic\":\"%s\","
+      "\"value_template\":\"{{value_json.pumpPins[%d]}}\","
+      "\"command_topic\":\"%s\",\"command_template\":\"{\\\"pumpPin%d\\\":{{value}}}\","
+      "\"min\":0,\"max\":28,\"mode\":\"box\","
+      "\"entity_category\":\"config\",%s}",
+      i + 1, UNIT_ID, i + 1,
+      CONFIG_STATE_TOPIC, i,
+      CONFIG_SET_TOPIC, i,
+      dev);
+    mqtt.publish(discPin, payload, true);
+
+    snprintf(payload, sizeof(payload),
+      "{\"name\":\"Pump %d Duration (s)\",\"unique_id\":\"%s_cfg_pump%d_dur\","
+      "\"state_topic\":\"%s\","
+      "\"value_template\":\"{{value_json.pumpDurations[%d]}}\","
+      "\"command_topic\":\"%s\",\"command_template\":\"{\\\"pumpDuration%d\\\":{{value}}}\","
+      "\"min\":1,\"max\":%d,\"mode\":\"box\","
+      "\"entity_category\":\"config\",%s}",
+      i + 1, UNIT_ID, i + 1,
+      CONFIG_STATE_TOPIC, i,
+      CONFIG_SET_TOPIC, i,
+      PUMP_MAX_DURATION_S,
+      dev);
+    mqtt.publish(discDur, payload, true);
+  }
+
+  // ── Network config ────────────────────────────────────────
+  // Static IP switch — payload_on/off are raw JSON sent to config/set topic
+  snprintf(payload, sizeof(payload),
+    "{\"name\":\"Static IP\",\"unique_id\":\"%s_cfg_static_ip\","
+    "\"state_topic\":\"%s\","
+    "\"value_template\":\"{%% if value_json.staticIP %%}ON{%% else %%}OFF{%% endif %%}\","
+    "\"command_topic\":\"%s\","
+    "\"payload_on\":\"{\\\"staticIP\\\":true}\","
+    "\"payload_off\":\"{\\\"staticIP\\\":false}\","
+    "\"entity_category\":\"config\",%s}",
+    UNIT_ID, CONFIG_STATE_TOPIC, CONFIG_SET_TOPIC, dev);
+  mqtt.publish(DISC_CFG_STATIC_IP, payload, true);
+
+  // IP address, gateway, subnet mask, DNS — text entities
+  const struct { const char* name; const char* uid; const char* key; const char* disc; } netFields[] = {
+    { "IP Address",  "cfg_ip",  "ip",  DISC_CFG_IP  },
+    { "Gateway",     "cfg_gw",  "gw",  DISC_CFG_GW  },
+    { "Subnet Mask", "cfg_sn",  "sn",  DISC_CFG_SN  },
+    { "DNS Server",  "cfg_dns", "dns", DISC_CFG_DNS },
+  };
+  for (auto& f : netFields) {
+    snprintf(payload, sizeof(payload),
+      "{\"name\":\"%s\",\"unique_id\":\"%s_%s\","
+      "\"state_topic\":\"%s\","
+      "\"value_template\":\"{{value_json.%s}}\","
+      "\"command_topic\":\"%s\","
+      "\"command_template\":\"{\\\"" "%s" "\\\":\\\"{{value}}\\\"}\","
+      "\"entity_category\":\"config\",%s}",
+      f.name, UNIT_ID, f.uid,
+      CONFIG_STATE_TOPIC, f.key,
+      CONFIG_SET_TOPIC, f.key,
+      dev);
+    mqtt.publish(f.disc, payload, true);
+  }
 
   logf("MQTT      — HA discovery published\n");
 }
@@ -1197,21 +1349,47 @@ void setup() {
     return;
   }
 
-  syslogFlush();
+  // NTP — sync before opening syslog so buffered messages get real timestamps.
+  // Matches moisture-sensor pattern: NTP first, syslogFlush after.
+  // No syslog UDP activity during the wait, so lwIP can service SNTP freely.
+  {
+    // DNS probe — log whether pool.ntp.org resolves and to what IP,
+    // so we can tell apart "DNS broken" from "UDP/firewall blocked".
+    IPAddress ntpIP;
+    int dnsResult = WiFi.hostByName(NTP_SERVER, ntpIP);
+    if (dnsResult == 1) {
+      logf("NTP       — %s → %s\n", NTP_SERVER, ntpIP.toString().c_str());
+    } else {
+      logf("NTP       — DNS failed for '%s' (result=%d)\n", NTP_SERVER, dnsResult);
+    }
 
-  // NTP
-  configTime(GMT_OFFSET_S, DST_OFFSET_S, NTP_SERVER);
-  logf("NTP       — syncing\n");
-  unsigned long ntpStart = millis();
-  struct tm t;
-  while (!getLocalTime(&t) && millis() - ntpStart < NTP_TIMEOUT_MS) delay(200);
-  if (getLocalTime(&t)) {
-    char ts[32];
-    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &t);
-    logf("NTP       — %s\n", ts);
-  } else {
-    logf("NTP       — sync timeout\n");
+    configTime(GMT_OFFSET_S, DST_OFFSET_S, NTP_SERVER);
+    logf("NTP       — syncing\n");
+    struct tm t;
+    bool synced = false;
+    unsigned long ntpStart = millis();
+    while (!synced) {
+      if (getLocalTime(&t, 0)) {   // 0 ms internal wait — poll, don't block
+        synced = true;
+      } else if (millis() - ntpStart >= NTP_TIMEOUT_MS) {
+        logf("NTP       — timed out, timestamps will be approximate\n");
+        break;
+      } else {
+        delay(200);
+      }
+    }
+    if (synced) {
+      logf("NTP       — %04d-%02d-%02dT%02d:%02d:%02dZ\n",
+        t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+        t.tm_hour, t.tm_min, t.tm_sec);
+    }
   }
+
+  // Bind UDP socket before first send, then flush buffered boot messages.
+  // (Mirrors moisture-sensor: syslogUdp.begin(0) → syslogFlush)
+  syslogUdp.begin(0);
+  logf("Syslog    — flushing\n");
+  syslogFlush();
 
   // FOTA check (once per boot)
   checkForUpdate();
@@ -1226,6 +1404,7 @@ void setup() {
 
 static unsigned long lastHeartbeat   = 0;
 static unsigned long lastMqttAttempt = 0;
+static unsigned long lastFotaCheck   = 0;  // 0 = checked on boot via setup()
 
 void loop() {
   // ── MQTT reconnect with cooldown ──────────────────────────
@@ -1238,6 +1417,7 @@ void loop() {
     }
   } else {
     mqtt.loop();
+    mqtt.loop();  // drain up to 2 queued messages per iteration
   }
 
   // ── Process deferred pump command ─────────────────────────
@@ -1267,6 +1447,17 @@ void loop() {
   if (mqtt.connected() && millis() - lastHeartbeat >= HEARTBEAT_INTERVAL_MS) {
     lastHeartbeat = millis();
     publishUnitState();
+  }
+
+  // ── Periodic FOTA check (hourly) ──────────────────────────
+  // Skip if any pump is running — don't interrupt an active water cycle.
+  if (millis() - lastFotaCheck >= FOTA_CHECK_INTERVAL_MS) {
+    bool anyRunning = false;
+    for (int i = 0; i < cfg.pumpCount; i++) anyRunning |= pumpSlot[i].running;
+    if (!anyRunning) {
+      lastFotaCheck = millis();
+      checkForUpdate();  // reboots on successful update; returns if already up to date
+    }
   }
 
   // ── Deferred config update ────────────────────────────────
