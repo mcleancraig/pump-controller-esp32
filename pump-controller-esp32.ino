@@ -26,7 +26,7 @@
 // ═══════════════════════════════════════════════════════════
 
 // Dev builds: update SHA suffix with `git rev-parse --short HEAD` after each commit.
-#define FIRMWARE_VERSION "0.1.0-dev.5e4955b"
+#define FIRMWARE_VERSION "0.1.0"
 
 // ── Hardware constants ────────────────────────────────────
 const int BTN_BOOT  = 9;      // Boot button — GPIO9 on Waveshare C6-Zero / XIAO C6
