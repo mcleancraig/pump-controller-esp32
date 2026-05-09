@@ -240,6 +240,12 @@ char DISC_CFG_MQTT_PASS[128];
 char DISC_CFG_SYSLOG_HOST[128];
 char DISC_CFG_SYSLOG_PORT[128];
 char DISC_CFG_PUMP_COUNT[128];
+// Network config discovery topics
+char DISC_CFG_STATIC_IP[128];
+char DISC_CFG_IP[128];
+char DISC_CFG_GW[128];
+char DISC_CFG_SN[128];
+char DISC_CFG_DNS[128];
 
 void buildDerivedConfig() {
   snprintf(UNIT_ID,            sizeof(UNIT_ID),            "pump%d",                    cfg.unitNumber);
@@ -271,6 +277,17 @@ void buildDerivedConfig() {
     "%s/number/%s_cfg_syslog_port/config", HA_DISCOVERY_PREFIX, UNIT_ID);
   snprintf(DISC_CFG_PUMP_COUNT,   sizeof(DISC_CFG_PUMP_COUNT),
     "%s/number/%s_cfg_pump_count/config",  HA_DISCOVERY_PREFIX, UNIT_ID);
+
+  snprintf(DISC_CFG_STATIC_IP,   sizeof(DISC_CFG_STATIC_IP),
+    "%s/switch/%s_cfg_static_ip/config",   HA_DISCOVERY_PREFIX, UNIT_ID);
+  snprintf(DISC_CFG_IP,          sizeof(DISC_CFG_IP),
+    "%s/text/%s_cfg_ip/config",            HA_DISCOVERY_PREFIX, UNIT_ID);
+  snprintf(DISC_CFG_GW,          sizeof(DISC_CFG_GW),
+    "%s/text/%s_cfg_gw/config",            HA_DISCOVERY_PREFIX, UNIT_ID);
+  snprintf(DISC_CFG_SN,          sizeof(DISC_CFG_SN),
+    "%s/text/%s_cfg_sn/config",            HA_DISCOVERY_PREFIX, UNIT_ID);
+  snprintf(DISC_CFG_DNS,         sizeof(DISC_CFG_DNS),
+    "%s/text/%s_cfg_dns/config",           HA_DISCOVERY_PREFIX, UNIT_ID);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -867,15 +884,23 @@ void publishConfigState() {
     snprintf(tmp, sizeof(tmp), "%d%s", cfg.pumpDuration[i], i < MAX_PUMPS-1 ? "," : "]");
     strlcat(durs, tmp, sizeof(durs));
   }
-  char payload[420];
+  char ipStr[16], gwStr[16], snStr[16], dnsStr[16];
+  snprintf(ipStr,  sizeof(ipStr),  "%d.%d.%d.%d", cfg.ip[0],  cfg.ip[1],  cfg.ip[2],  cfg.ip[3]);
+  snprintf(gwStr,  sizeof(gwStr),  "%d.%d.%d.%d", cfg.gw[0],  cfg.gw[1],  cfg.gw[2],  cfg.gw[3]);
+  snprintf(snStr,  sizeof(snStr),  "%d.%d.%d.%d", cfg.sn[0],  cfg.sn[1],  cfg.sn[2],  cfg.sn[3]);
+  snprintf(dnsStr, sizeof(dnsStr), "%d.%d.%d.%d", cfg.dns[0], cfg.dns[1], cfg.dns[2], cfg.dns[3]);
+
+  char payload[512];
   snprintf(payload, sizeof(payload),
     "{\"mqttBroker\":\"%s\",\"mqttPort\":%d,\"mqttUser\":\"%s\","
     "\"mqttPassword\":\"***\","
     "\"syslogHost\":\"%s\",\"syslogPort\":%d,"
-    "\"pumpCount\":%d,\"pumpPins\":%s,\"pumpDurations\":%s}",
+    "\"pumpCount\":%d,\"pumpPins\":%s,\"pumpDurations\":%s,"
+    "\"staticIP\":%s,\"ip\":\"%s\",\"gw\":\"%s\",\"sn\":\"%s\",\"dns\":\"%s\"}",
     cfg.mqttBroker, cfg.mqttPort, cfg.mqttUser,
     cfg.syslogHost, cfg.syslogPort,
-    cfg.pumpCount, pins, durs);
+    cfg.pumpCount, pins, durs,
+    cfg.staticIP ? "true" : "false", ipStr, gwStr, snStr, dnsStr);
   mqtt.publish(CONFIG_STATE_TOPIC, payload, true);
 }
 
@@ -910,6 +935,14 @@ void applyConfigUpdate(const char* json) {
     return true;
   };
 
+  // Helper: parse a dotted IPv4 string into a 4-byte array
+  auto parseIP = [](const char* str, uint8_t* bytes) -> bool {
+    IPAddress addr;
+    if (!addr.fromString(str)) return false;
+    bytes[0] = addr[0]; bytes[1] = addr[1]; bytes[2] = addr[2]; bytes[3] = addr[3];
+    return true;
+  };
+
   char tmp[64];
   int  ival;
 
@@ -920,6 +953,14 @@ void applyConfigUpdate(const char* json) {
   if (extractStr(json, "syslogHost",   tmp, sizeof(tmp))) strlcpy(cfg.syslogHost,   tmp, sizeof(cfg.syslogHost));
   if (extractInt(json, "syslogPort",   &ival) && isValidPort(ival)) cfg.syslogPort = ival;
   if (extractInt(json, "pumpCount",    &ival) && ival >= 1 && ival <= MAX_PUMPS) cfg.pumpCount = ival;
+
+  // Network / static IP
+  if (strstr(json, "\"staticIP\":true"))  cfg.staticIP = true;
+  if (strstr(json, "\"staticIP\":false")) cfg.staticIP = false;
+  if (extractStr(json, "ip",  tmp, sizeof(tmp))) parseIP(tmp, cfg.ip);
+  if (extractStr(json, "gw",  tmp, sizeof(tmp))) parseIP(tmp, cfg.gw);
+  if (extractStr(json, "sn",  tmp, sizeof(tmp))) parseIP(tmp, cfg.sn);
+  if (extractStr(json, "dns", tmp, sizeof(tmp))) parseIP(tmp, cfg.dns);
 
   for (int i = 0; i < MAX_PUMPS; i++) {
     char keyPin[24], keyDur[24];
@@ -1108,6 +1149,41 @@ void publishHADiscovery() {
       PUMP_MAX_DURATION_S,
       dev);
     mqtt.publish(discDur, payload, true);
+  }
+
+  // ── Network config ────────────────────────────────────────
+  // Static IP switch — payload_on/off are raw JSON sent to config/set topic
+  snprintf(payload, sizeof(payload),
+    "{\"name\":\"Static IP\",\"unique_id\":\"%s_cfg_static_ip\","
+    "\"state_topic\":\"%s\","
+    "\"value_template\":\"{%% if value_json.staticIP %%}ON{%% else %%}OFF{%% endif %%}\","
+    "\"command_topic\":\"%s\","
+    "\"payload_on\":\"{\\\"staticIP\\\":true}\","
+    "\"payload_off\":\"{\\\"staticIP\\\":false}\","
+    "\"entity_category\":\"config\",%s}",
+    UNIT_ID, CONFIG_STATE_TOPIC, CONFIG_SET_TOPIC, dev);
+  mqtt.publish(DISC_CFG_STATIC_IP, payload, true);
+
+  // IP address, gateway, subnet mask, DNS — text entities
+  const struct { const char* name; const char* uid; const char* key; const char* disc; } netFields[] = {
+    { "IP Address",  "cfg_ip",  "ip",  DISC_CFG_IP  },
+    { "Gateway",     "cfg_gw",  "gw",  DISC_CFG_GW  },
+    { "Subnet Mask", "cfg_sn",  "sn",  DISC_CFG_SN  },
+    { "DNS Server",  "cfg_dns", "dns", DISC_CFG_DNS },
+  };
+  for (auto& f : netFields) {
+    snprintf(payload, sizeof(payload),
+      "{\"name\":\"%s\",\"unique_id\":\"%s_%s\","
+      "\"state_topic\":\"%s\","
+      "\"value_template\":\"{{value_json.%s}}\","
+      "\"command_topic\":\"%s\","
+      "\"command_template\":\"{\\\"" "%s" "\\\":\\\"{{value}}\\\"}\","
+      "\"entity_category\":\"config\",%s}",
+      f.name, UNIT_ID, f.uid,
+      CONFIG_STATE_TOPIC, f.key,
+      CONFIG_SET_TOPIC, f.key,
+      dev);
+    mqtt.publish(f.disc, payload, true);
   }
 
   logf("MQTT      — HA discovery published\n");
