@@ -1276,19 +1276,33 @@ void setup() {
   // NTP — sync before opening syslog so buffered messages get real timestamps.
   // Matches moisture-sensor pattern: NTP first, syslogFlush after.
   // No syslog UDP activity during the wait, so lwIP can service SNTP freely.
-  configTime(GMT_OFFSET_S, DST_OFFSET_S, NTP_SERVER);
-  logf("NTP       — syncing\n");
   {
+    // DNS probe — log whether pool.ntp.org resolves and to what IP,
+    // so we can tell apart "DNS broken" from "UDP/firewall blocked".
+    IPAddress ntpIP;
+    int dnsResult = WiFi.hostByName(NTP_SERVER, ntpIP);
+    if (dnsResult == 1) {
+      logf("NTP       — %s → %s\n", NTP_SERVER, ntpIP.toString().c_str());
+    } else {
+      logf("NTP       — DNS failed for '%s' (result=%d)\n", NTP_SERVER, dnsResult);
+    }
+
+    configTime(GMT_OFFSET_S, DST_OFFSET_S, NTP_SERVER);
+    logf("NTP       — syncing\n");
     struct tm t;
+    bool synced = false;
     unsigned long ntpStart = millis();
-    while (!getLocalTime(&t)) {
-      if (millis() - ntpStart >= NTP_TIMEOUT_MS) {
+    while (!synced) {
+      if (getLocalTime(&t, 0)) {   // 0 ms internal wait — poll, don't block
+        synced = true;
+      } else if (millis() - ntpStart >= NTP_TIMEOUT_MS) {
         logf("NTP       — timed out, timestamps will be approximate\n");
         break;
+      } else {
+        delay(200);
       }
-      delay(500);
     }
-    if (getLocalTime(&t)) {
+    if (synced) {
       logf("NTP       — %04d-%02d-%02dT%02d:%02d:%02dZ\n",
         t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
         t.tm_hour, t.tm_min, t.tm_sec);
