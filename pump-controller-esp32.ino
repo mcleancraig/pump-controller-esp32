@@ -34,7 +34,7 @@
 // ═══════════════════════════════════════════════════════════
 
 // Dev builds: update SHA suffix with `git rev-parse --short HEAD` after each commit.
-#define FIRMWARE_VERSION "0.2.0-dev.8a80e65"
+#define FIRMWARE_VERSION "0.2.0-dev.666a4b3"
 
 // ── Hardware constants ────────────────────────────────────
 const int BTN_BOOT  = 9;      // Boot button — GPIO9 on Waveshare C6-Zero / XIAO C6
@@ -717,6 +717,20 @@ void handleSave() {
   int waterPin = server.hasArg("waterPin") ? server.arg("waterPin").toInt() : -1;
   c.waterLevelPin = (waterPin >= -1 && waterPin <= 28) ? waterPin : -1;
 
+  // Reject conflicting GPIO assignments
+  for (int i = 0; i < c.pumpCount; i++) {
+    for (int j = i + 1; j < c.pumpCount; j++) {
+      if (c.pumpPin[i] == c.pumpPin[j]) {
+        server.send(400, "text/plain",
+          "Pump " + String(i+1) + " and pump " + String(j+1) + " share the same GPIO"); return;
+      }
+    }
+    if (c.waterLevelPin >= 0 && c.pumpPin[i] == c.waterLevelPin) {
+      server.send(400, "text/plain",
+        "Pump " + String(i+1) + " and water level sensor share the same GPIO"); return;
+    }
+  }
+
   saveConfig(c);
   server.send(200, "text/html",
     "<html><body><h2 style='font-family:sans-serif;color:#1a5fa8'>Saved! Restarting...</h2></body></html>");
@@ -1031,13 +1045,25 @@ void applyConfigUpdate(const char* json) {
   if (extractStr(json, "gw",  tmp, sizeof(tmp))) parseIP(tmp, cfg.gw);
   if (extractStr(json, "sn",  tmp, sizeof(tmp))) parseIP(tmp, cfg.sn);
   if (extractStr(json, "dns", tmp, sizeof(tmp))) parseIP(tmp, cfg.dns);
-  if (extractInt(json, "waterLevelPin", &ival) && ival >= -1 && ival <= 28) cfg.waterLevelPin = ival;
+  if (extractInt(json, "waterLevelPin", &ival) && ival >= -1 && ival <= 28) {
+    bool conflict = false;
+    for (int i = 0; i < MAX_PUMPS && !conflict; i++)
+      if (ival >= 0 && cfg.pumpPin[i] == ival) conflict = true;
+    if (!conflict) cfg.waterLevelPin = ival;
+    else logf("Config    — waterLevelPin %d rejected (conflicts with pump pin)\n", ival);
+  }
 
   for (int i = 0; i < MAX_PUMPS; i++) {
     char keyPin[24], keyDur[24];
     snprintf(keyPin, sizeof(keyPin), "pumpPin%d", i);
     snprintf(keyDur, sizeof(keyDur), "pumpDuration%d", i);
-    if (extractInt(json, keyPin, &ival) && ival >= 0 && ival <= 28) cfg.pumpPin[i] = ival;
+    if (extractInt(json, keyPin, &ival) && ival >= 0 && ival <= 28) {
+      bool conflict = (ival == cfg.waterLevelPin);
+      for (int j = 0; j < MAX_PUMPS && !conflict; j++)
+        if (j != i && cfg.pumpPin[j] == ival) conflict = true;
+      if (!conflict) cfg.pumpPin[i] = ival;
+      else logf("Config    — pumpPin%d=%d rejected (conflicts with existing pin)\n", i, ival);
+    }
     if (extractInt(json, keyDur, &ival) && ival >= 1 && ival <= PUMP_MAX_DURATION_S)
       cfg.pumpDuration[i] = ival;
   }
