@@ -11,13 +11,13 @@
 #include "esp_mac.h"
 
 // ═══════════════════════════════════════════════════════════
-//  v0.2.0
-//  - Water level sensor: NO reed switch + float/magnet detects when the
-//    water supply is running low. Reed open (HIGH on INPUT_PULLUP) = low
-//    water. Configurable GPIO pin (waterLevelPin, default -1 = disabled).
-//    2-second hardware debounce. Publishes a HA binary_sensor (device_class
-//    problem) and logs a "Water LOW" alert on transition. Pin settable via
-//    the captive portal and via HA config entity without reflashing.
+//  v1.0.0
+//  - Water level sensor: NO reed switch + float/magnet. Float drops when
+//    tank is low → magnet closes reed → GPIO LOW = water LOW. Reed open
+//    (INPUT_PULLUP HIGH) = water OK. 2-second debounce. HA binary_sensor
+//    (device_class: problem). Pump start blocked when water is LOW.
+//    GPIO conflict detection at boot (warnings) and on save (rejected).
+//    Pin configurable via portal and HA number entity.
 //
 //  v0.1.0
 //  - NVS magic key: loadConfig() checks for "pump-ctrl-1" magic in the
@@ -33,8 +33,7 @@
 //  - MQTT callback safety: no publish() inside callback; deferred via flags
 // ═══════════════════════════════════════════════════════════
 
-// Dev builds: update SHA suffix with `git rev-parse --short HEAD` after each commit.
-#define FIRMWARE_VERSION "0.2.0-dev.666a4b3"
+#define FIRMWARE_VERSION "1.0.0"
 
 // ── Hardware constants ────────────────────────────────────
 const int BTN_BOOT  = 9;      // Boot button — GPIO9 on Waveshare C6-Zero / XIAO C6
@@ -177,6 +176,23 @@ void loadConfig() {
   configLoaded = (cfg.unitNumber > 0 &&
                   strlen(cfg.wifiSSID) > 0 &&
                   strlen(cfg.mqttBroker) > 0);
+}
+
+// Logs a warning for every pin conflict found in cfg.
+// Called at boot after loadConfig() so problems surface in syslog immediately.
+void validateConfig() {
+  for (int i = 0; i < cfg.pumpCount; i++) {
+    for (int j = i + 1; j < cfg.pumpCount; j++) {
+      if (cfg.pumpPin[i] == cfg.pumpPin[j]) {
+        logf("Config    — WARNING: pump %d and pump %d share GPIO%d\n",
+          i + 1, j + 1, cfg.pumpPin[i]);
+      }
+    }
+    if (cfg.waterLevelPin >= 0 && cfg.pumpPin[i] == cfg.waterLevelPin) {
+      logf("Config    — WARNING: pump %d and water level sensor share GPIO%d\n",
+        i + 1, cfg.waterLevelPin);
+    }
+  }
 }
 
 void clearConfig() {
@@ -589,7 +605,7 @@ const char CONFIG_HTML[] PROGMEM = R"rawhtml(
       <label style="margin-top:12px">Reed switch GPIO pin
         <input type="number" name="waterPin" value="-1" min="-1" max="28">
       </label>
-      <p class="hint">Normally-open reed switch with float and magnet. Reed closes (LOW) when water is present; opens (HIGH) when the tank runs low. Set to -1 to disable.</p>
+      <p class="hint">Normally-open reed switch with float and magnet. Float drops when tank is low, bringing the magnet to the reed and closing it (GPIO LOW = water low). Reed open (GPIO HIGH) = water OK. Set to -1 to disable.</p>
     </details>
   </div>
 
@@ -816,6 +832,9 @@ struct PumpSlot {
 
 static PumpSlot pumpSlot[MAX_PUMPS];
 
+// Forward declaration — defined with updateWaterLevel() below startPump().
+static bool waterLevelLow = false;
+
 void stopPump(int idx) {
   if (idx < 0 || idx >= MAX_PUMPS) return;
   bool wasRunning = pumpSlot[idx].running;
@@ -832,6 +851,10 @@ void stopPump(int idx) {
 
 void startPump(int idx) {
   if (idx < 0 || idx >= cfg.pumpCount) return;
+  if (cfg.waterLevelPin >= 0 && waterLevelLow) {
+    logf("Pump %d   — blocked (water LOW)\n", idx + 1);
+    return;
+  }
   int capDur = min(cfg.pumpDuration[idx], PUMP_MAX_DURATION_S);
   pumpSlot[idx].running    = true;
   pumpSlot[idx].startMs    = millis();
@@ -915,9 +938,9 @@ void publishPumpState(int idx) {
 }
 
 // ── Water level sensor state ──────────────────────────────
-// NO reed switch: float up + magnet → reed closed → INPUT_PULLUP reads LOW = OK.
-// Float drops (low water) → magnet away → reed opens → reads HIGH = LOW water.
-static bool waterLevelLow     = false;  // current debounced state
+// NO reed switch: float drops when tank is low → magnet reaches reed → reed closes → GPIO LOW = water LOW.
+// Float up (water OK) → magnet away from reed → reed open → INPUT_PULLUP holds GPIO HIGH = OK.
+// waterLevelLow declared above startPump() so the pump guard can reference it.
 static int  waterLevelPinLast = -2;     // last raw read (-2 = uninitialised)
 static unsigned long waterLevelStableMs = 0;
 
@@ -928,20 +951,20 @@ void publishWaterLevel() {
 
 void updateWaterLevel() {
   if (cfg.waterLevelPin < 0) return;
-  int raw = digitalRead(cfg.waterLevelPin);   // HIGH = reed open = water low
+  int raw = digitalRead(cfg.waterLevelPin);   // LOW = reed closed = water low
   if (raw != waterLevelPinLast) {
     waterLevelPinLast = raw;
     waterLevelStableMs = millis();
     return;  // restart debounce timer
   }
   if (millis() - waterLevelStableMs < WATER_DEBOUNCE_MS) return;  // still settling
-  bool nowLow = (raw == HIGH);
+  bool nowLow = (raw == LOW);
   if (nowLow == waterLevelLow) return;  // no change
   waterLevelLow = nowLow;
   if (waterLevelLow) {
-    logf("Water     — LOW (reed open, GPIO%d HIGH)\n", cfg.waterLevelPin);
+    logf("Water     — LOW (reed closed, GPIO%d LOW)\n", cfg.waterLevelPin);
   } else {
-    logf("Water     — OK (reed closed, GPIO%d LOW)\n", cfg.waterLevelPin);
+    logf("Water     — OK (reed open, GPIO%d HIGH)\n", cfg.waterLevelPin);
   }
   if (mqtt.connected()) publishWaterLevel();
 }
@@ -1457,6 +1480,7 @@ void setup() {
   loadConfig();
   logf("Config    — unit=%d ssid='%s' mqtt=%s:%d pumps=%d\n",
     cfg.unitNumber, cfg.wifiSSID, cfg.mqttBroker, cfg.mqttPort, cfg.pumpCount);
+  validateConfig();
 
   if (!configLoaded) {
     logf("Config    — not configured, starting portal\n");
@@ -1474,7 +1498,7 @@ void setup() {
     pinMode(cfg.waterLevelPin, INPUT_PULLUP);
     waterLevelPinLast = digitalRead(cfg.waterLevelPin);
     waterLevelStableMs = millis();
-    waterLevelLow = (waterLevelPinLast == HIGH);
+    waterLevelLow = (waterLevelPinLast == LOW);
     logf("Water     — pin GPIO%d, initial state: %s\n",
       cfg.waterLevelPin, waterLevelLow ? "LOW" : "OK");
   }
