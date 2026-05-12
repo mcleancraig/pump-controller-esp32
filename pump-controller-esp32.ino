@@ -963,6 +963,7 @@ void updateWaterLevel() {
   waterLevelLow = nowLow;
   if (waterLevelLow) {
     logf("Water     — LOW (reed closed, GPIO%d LOW)\n", cfg.waterLevelPin);
+    for (int i = 0; i < cfg.pumpCount; i++) stopPump(i);
   } else {
     logf("Water     — OK (reed open, GPIO%d HIGH)\n", cfg.waterLevelPin);
   }
