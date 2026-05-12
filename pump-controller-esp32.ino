@@ -33,7 +33,7 @@
 //  - MQTT callback safety: no publish() inside callback; deferred via flags
 // ═══════════════════════════════════════════════════════════
 
-#define FIRMWARE_VERSION "1.0.0"
+#define FIRMWARE_VERSION "1.0.1-dev.dd7c59e"
 
 // ── Hardware constants ────────────────────────────────────
 const int BTN_BOOT  = 9;      // Boot button — GPIO9 on Waveshare C6-Zero / XIAO C6
@@ -963,6 +963,7 @@ void updateWaterLevel() {
   waterLevelLow = nowLow;
   if (waterLevelLow) {
     logf("Water     — LOW (reed closed, GPIO%d LOW)\n", cfg.waterLevelPin);
+    for (int i = 0; i < cfg.pumpCount; i++) stopPump(i);
   } else {
     logf("Water     — OK (reed open, GPIO%d HIGH)\n", cfg.waterLevelPin);
   }
