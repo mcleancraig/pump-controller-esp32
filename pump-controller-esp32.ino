@@ -11,6 +11,9 @@
 #include "esp_mac.h"
 
 // ═══════════════════════════════════════════════════════════
+//  v1.0.1
+//  - Stop all running pumps immediately when water level transitions to LOW
+//
 //  v1.0.0
 //  - Water level sensor: NO reed switch + float/magnet. Float drops when
 //    tank is low → magnet closes reed → GPIO LOW = water LOW. Reed open
@@ -33,7 +36,7 @@
 //  - MQTT callback safety: no publish() inside callback; deferred via flags
 // ═══════════════════════════════════════════════════════════
 
-#define FIRMWARE_VERSION "1.0.0"
+#define FIRMWARE_VERSION "1.0.1"
 
 // ── Hardware constants ────────────────────────────────────
 const int BTN_BOOT  = 9;      // Boot button — GPIO9 on Waveshare C6-Zero / XIAO C6
@@ -963,6 +966,7 @@ void updateWaterLevel() {
   waterLevelLow = nowLow;
   if (waterLevelLow) {
     logf("Water     — LOW (reed closed, GPIO%d LOW)\n", cfg.waterLevelPin);
+    for (int i = 0; i < cfg.pumpCount; i++) stopPump(i);
   } else {
     logf("Water     — OK (reed open, GPIO%d HIGH)\n", cfg.waterLevelPin);
   }
