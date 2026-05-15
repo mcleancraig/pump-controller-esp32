@@ -144,13 +144,13 @@ void loadConfig() {
     cfg.ip[0] = 192; cfg.ip[1] = 168; cfg.ip[2] = 211; cfg.ip[3] = 1;
   }
   if (prefs.getBytes("gw",  cfg.gw,  4) == 0) {
-    cfg.gw[0] = 192; cfg.gw[1] = 168; cfg.gw[2] = 211; cfg.gw[3] = 1;
+    cfg.gw[0] = 192; cfg.gw[1] = 168; cfg.gw[2] =   1; cfg.gw[3] = 1;
   }
   if (prefs.getBytes("sn",  cfg.sn,  4) == 0) {
     cfg.sn[0] = 255; cfg.sn[1] = 255; cfg.sn[2] = 0; cfg.sn[3] = 0;
   }
   if (prefs.getBytes("dns", cfg.dns, 4) == 0) {
-    cfg.dns[0] = 192; cfg.dns[1] = 168; cfg.dns[2] = 211; cfg.dns[3] = 1;
+    cfg.dns[0] = 192; cfg.dns[1] = 168; cfg.dns[2] =   1; cfg.dns[3] = 1;
   }
 
   prefs.getString("mqttBroker", cfg.mqttBroker,  sizeof(cfg.mqttBroker));
@@ -527,7 +527,7 @@ const char CONFIG_HTML[] PROGMEM = R"rawhtml(
         <span>.</span>
         <input type="number" name="gw2" value="168" min="0" max="255">
         <span>.</span>
-        <input type="number" name="gw3" value="211" min="0" max="255">
+        <input type="number" name="gw3" value="1" min="0" max="255">
         <span>.</span>
         <input type="number" name="gw4" value="1" min="0" max="255">
       </div>
@@ -547,7 +547,7 @@ const char CONFIG_HTML[] PROGMEM = R"rawhtml(
         <span>.</span>
         <input type="number" name="dns2" value="168" min="0" max="255">
         <span>.</span>
-        <input type="number" name="dns3" value="211" min="0" max="255">
+        <input type="number" name="dns3" value="1" min="0" max="255">
         <span>.</span>
         <input type="number" name="dns4" value="1" min="0" max="255">
       </div>
