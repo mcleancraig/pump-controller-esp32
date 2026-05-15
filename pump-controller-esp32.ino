@@ -1074,7 +1074,8 @@ void applyConfigUpdate(const char* json) {
   if (extractStr(json, "dns", tmp, sizeof(tmp))) parseIP(tmp, cfg.dns);
   if (extractInt(json, "waterLevelPin", &ival) && ival >= -1 && ival <= 28) {
     bool conflict = false;
-    for (int i = 0; i < MAX_PUMPS && !conflict; i++)
+    // Only check against active pump slots — inactive slots hold stale defaults
+    for (int i = 0; i < cfg.pumpCount && !conflict; i++)
       if (ival >= 0 && cfg.pumpPin[i] == ival) conflict = true;
     if (!conflict) cfg.waterLevelPin = ival;
     else logf("Config    — waterLevelPin %d rejected (conflicts with pump pin)\n", ival);
@@ -1086,7 +1087,8 @@ void applyConfigUpdate(const char* json) {
     snprintf(keyDur, sizeof(keyDur), "pumpDuration%d", i);
     if (extractInt(json, keyPin, &ival) && ival >= 0 && ival <= 28) {
       bool conflict = (ival == cfg.waterLevelPin);
-      for (int j = 0; j < MAX_PUMPS && !conflict; j++)
+      // Only check against active pump slots — inactive slots hold stale defaults
+      for (int j = 0; j < cfg.pumpCount && !conflict; j++)
         if (j != i && cfg.pumpPin[j] == ival) conflict = true;
       if (!conflict) cfg.pumpPin[i] = ival;
       else logf("Config    — pumpPin%d=%d rejected (conflicts with existing pin)\n", i, ival);
@@ -1599,12 +1601,18 @@ void loop() {
     if (mqtt.connected()) publishPumpState(idx);
   }
 
-  // ── Pump auto-stop (safety cap / duration expiry) ─────────
+  // ── Pump auto-stop (safety cap / duration expiry / water LOW) ────
   for (int i = 0; i < cfg.pumpCount; i++) {
-    if (pumpSlot[i].running &&
-        millis() - pumpSlot[i].startMs >= (unsigned long)pumpSlot[i].durationMs) {
+    if (!pumpSlot[i].running) continue;
+    if (millis() - pumpSlot[i].startMs >= (unsigned long)pumpSlot[i].durationMs) {
       stopPump(i);
       logf("Pump %d   — stopped (duration elapsed)\n", i + 1);
+      if (mqtt.connected()) publishPumpState(i);
+    } else if (cfg.waterLevelPin >= 0 && digitalRead(cfg.waterLevelPin) == LOW) {
+      // Raw pin check — no debounce — so a running pump is cut immediately
+      // when the reed closes, regardless of where the debounced state machine is.
+      stopPump(i);
+      logf("Pump %d   — stopped (water LOW, raw pin)\n", i + 1);
       if (mqtt.connected()) publishPumpState(i);
     }
   }
