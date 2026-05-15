@@ -141,7 +141,7 @@ void loadConfig() {
   cfg.staticIP    = prefs.getBool("staticIP", false);
 
   if (prefs.getBytes("ip",  cfg.ip,  4) == 0) {
-    cfg.ip[0] = 192; cfg.ip[1] = 168; cfg.ip[2] = 211; cfg.ip[3] = 1;
+    cfg.ip[0] = 192; cfg.ip[1] = 168; cfg.ip[2] = 211; cfg.ip[3] = cfg.unitNumber;
   }
   if (prefs.getBytes("gw",  cfg.gw,  4) == 0) {
     cfg.gw[0] = 192; cfg.gw[1] = 168; cfg.gw[2] =   1; cfg.gw[3] = 1;
