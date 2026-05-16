@@ -993,9 +993,9 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   // Extract pump index I from topic: "garden/pumpN/pump/I/cmd"
   char prefix[80];
   snprintf(prefix, sizeof(prefix), "garden/%s/pump/", UNIT_ID);
-  size_t prefixLen = strlen(prefix);
-  if (strncmp(topic, prefix, prefixLen) == 0) {
-    int pumpNumber = atoi(topic + prefixLen);   // 1-based
+  size_t pumpPrefixLen = strlen(prefix);
+  if (strncmp(topic, prefix, pumpPrefixLen) == 0) {
+    int pumpNumber = atoi(topic + pumpPrefixLen);   // 1-based
     int idx = pumpNumber - 1;                    // 0-based
     if (idx >= 0 && idx < cfg.pumpCount) {
       // Serial only — no logf/syslog inside MQTT callback
@@ -1749,7 +1749,8 @@ void setup() {
 
   // Watchdog — started after FOTA so the potentially long TLS download doesn't trip it.
   // 60 s covers the longest expected loop() operation (FOTA download: max FOTA_DL_TIMEOUT_MS).
-  esp_task_wdt_init(60, true);
+  const esp_task_wdt_config_t wdtCfg = { .timeout_ms = 60000, .idle_core_mask = 0, .trigger_panic = true };
+  esp_task_wdt_init(&wdtCfg);
   esp_task_wdt_add(NULL);
   logf("Watchdog  — started (60s timeout)\n");
   logf("Heap      — free: %u bytes (min: %u)\n", ESP.getFreeHeap(), ESP.getMinFreeHeap());
