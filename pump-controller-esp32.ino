@@ -921,6 +921,7 @@ static bool pendingReset   = false;
 // Config update payload (JSON) from MQTT
 static char  pendingConfigPayload[256];
 static bool  pendingConfigUpdate = false;
+static bool  pendingFotaCheck   = false;
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   char msg[64];
@@ -1101,8 +1102,11 @@ void applyConfigUpdate(const char* json) {
   if (extractStr(json, "dns", tmp, sizeof(tmp))) parseIP(tmp, cfg.dns);
   if (extractStr(json, "fwChannel", tmp, sizeof(tmp))) {
     if (strcmp(tmp, "stable") == 0 || strcmp(tmp, "beta") == 0) {
-      strlcpy(cfg.fwChannel, tmp, sizeof(cfg.fwChannel));
-      logf("Config    — fwChannel -> %s\n", tmp);
+      if (strcmp(tmp, cfg.fwChannel) != 0) {
+        strlcpy(cfg.fwChannel, tmp, sizeof(cfg.fwChannel));
+        logf("Config    — fwChannel -> %s, scheduling FOTA check\n", tmp);
+        pendingFotaCheck = true;
+      }
     } else {
       logf("Config    — fwChannel rejected: must be 'stable' or 'beta'\n");
     }
@@ -1759,14 +1763,20 @@ void loop() {
   // ── Water level sensor ────────────────────────────────────
   updateWaterLevel();
 
-  // ── Periodic FOTA check (hourly) ──────────────────────────
+  // ── FOTA check — hourly or on channel change ──────────────
   // Skip if any pump is running — don't interrupt an active water cycle.
-  if (millis() - lastFotaCheck >= FOTA_CHECK_INTERVAL_MS) {
+  {
     bool anyRunning = false;
     for (int i = 0; i < cfg.pumpCount; i++) anyRunning |= pumpSlot[i].running;
     if (!anyRunning) {
-      lastFotaCheck = millis();
-      checkForUpdate();  // reboots on successful update; returns if already up to date
+      if (pendingFotaCheck) {
+        pendingFotaCheck = false;
+        lastFotaCheck = millis();
+        checkForUpdate();
+      } else if (millis() - lastFotaCheck >= FOTA_CHECK_INTERVAL_MS) {
+        lastFotaCheck = millis();
+        checkForUpdate();
+      }
     }
   }
 
