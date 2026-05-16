@@ -8,12 +8,14 @@ Firmware for a WiFi-connected garden pump controller based on the **Waveshare ES
 - **Hardware safety cap** — maximum pump run time enforced in firmware, not overridable via config or MQTT
 - **Water level sensor** — NO reed switch + float/magnet detects low tank; blocks and immediately stops pumps when triggered
 - **Captive portal** — first-boot WiFi and full device configuration via web browser
-- **MQTT** — per-pump command/state topics; unit heartbeat; config get/set
+- **MQTT** — per-pump command/state topics; unit heartbeat; availability LWT; config get/set per field
 - **Home Assistant autodiscovery** — pumps, water level binary sensor, and all config fields appear automatically in HA
-- **FOTA** — checks GitHub Releases hourly; self-updates when a newer version is available
+- **FOTA** — checks GitHub Releases hourly; self-updates when a newer version is available; optional beta channel
 - **Syslog** — structured log output to a UDP syslog server
 - **NTP** — clock sync at boot for accurate log timestamps
 - **Static IP support** — optional, configurable via portal or HA entities
+- **Hardware watchdog** — 60 s WDT resets device if main loop stalls
+- **WiFi reconnect** — automatic reassociation without reboot if connection drops
 
 ## Hardware
 
@@ -66,29 +68,68 @@ All topics are prefixed with `garden/pumpN/` where N is the unit number set in t
 
 | Topic | Direction | Payload | Notes |
 |---|---|---|---|
-| `garden/pump1/state` | publish | JSON | Heartbeat every 30 s — firmware version, uptime, RSSI, pump states |
+| `garden/pump1/availability` | publish | `online` / `offline` | Retained; LWT publishes `offline` on disconnect |
+| `garden/pump1/state` | publish | JSON | Heartbeat every 30 s |
 | `garden/pump1/pump/N/cmd` | subscribe | `water` / `stop` | Trigger or stop pump N |
 | `garden/pump1/pump/N/state` | publish | `ON` / `OFF` | Retained pump state |
-| `garden/pump1/water_level` | publish | `OK` / `LOW` | Retained; published on change and reconnect |
-| `garden/pump1/config/set` | subscribe | JSON | Update any config field at runtime |
-| `garden/pump1/config/state` | publish | JSON | Full config state; published on connect and after changes |
+| `garden/pump1/water_level` | publish | JSON | Retained; published on change and reconnect |
+| `garden/pump1/config/set/+` | subscribe | raw value | Set a single config field by name (see below) |
+| `garden/pump1/config/state` | publish | JSON | Full config; published on connect and after changes |
 | `garden/pump1/cmd` | subscribe | `restart` / `reset` | Restart or factory-reset the device |
+
+### State payload example
+
+```json
+{
+  "fw_version": "1.1.0",
+  "uptime": 3600,
+  "rssi": -62,
+  "pump1": false,
+  "pump2": false
+}
+```
+
+### Water level payload example
+
+```json
+{"water_level": "OK"}
+```
+
+### Per-field config set
+
+Publish a raw value (not JSON) to `garden/pump1/config/set/<field>`:
+
+| Field | Type | Example topic | Example payload |
+|---|---|---|---|
+| `pumpDuration1` | integer (seconds) | `garden/pump1/config/set/pumpDuration1` | `30` |
+| `pumpPin1` | integer (GPIO) | `garden/pump1/config/set/pumpPin1` | `3` |
+| `waterLevelPin` | integer (GPIO) | `garden/pump1/config/set/waterLevelPin` | `20` |
+| `mqttBroker` | string | `garden/pump1/config/set/mqttBroker` | `192.168.1.10` |
+| `staticIP` | boolean | `garden/pump1/config/set/staticIP` | `ON` / `OFF` |
+| `fwChannel` | string | `garden/pump1/config/set/fwChannel` | `beta` |
 
 ## Home Assistant
 
 Entities appear automatically via MQTT autodiscovery under the device **"Garden Pump Controller N"**:
 
 - **Switch** per pump (starts/stops with configured duration)
-- **Binary sensor** — Water Level (`device_class: problem`, ON = LOW)
-- **Number** entities for all config fields (pump pins, durations, water level pin, MQTT, syslog, etc.)
+- **Binary sensor** — Water Level (`device_class: problem`, ON = LOW); update value template to `{{ value_json.water_level }}`
+- **Number** entities for all config fields (pump pins, durations, water level pin, etc.)
 - **Switch** for static IP enable
-- **Text** entities for IP / gateway / subnet / DNS
-- **Button** — Restart / Factory Reset
-- **Sensor** — Firmware version
+- **Text** entities for IP / gateway / subnet / DNS / MQTT broker / syslog host
+- **Select** — FOTA channel (`stable` / `beta`)
+- **Button** — Restart / Factory Reset / Firmware Update
+- **Sensor** — Firmware version; uses `value_json.fw_version`
+
+### Availability
+
+All entities use `garden/pumpN/availability` with `payload_available: online` and `payload_not_available: offline`. The device publishes `online` on MQTT connect and `offline` via LWT on unexpected disconnect.
 
 ## FOTA
 
-The device checks `https://github.com/mcleancraig/pump-controller-esp32/releases/latest/download/version.txt` every hour. If the remote version differs from the running firmware it downloads and flashes `pump-controller-esp32.ino.bin` from the same release.
+The device checks `https://github.com/mcleancraig/pump-controller-esp32/releases/latest/download/version.txt` hourly. If the remote version is newer (integer semver comparison) it downloads and flashes `pump-controller-esp32.ino.bin` from the same release.
+
+Set `fwChannel` to `beta` via MQTT or HA to track pre-release builds instead.
 
 ## Build & Flash
 
@@ -98,30 +139,29 @@ Requires [arduino-cli](https://arduino.github.io/arduino-cli/) and the `esp32:es
 
 ```bash
 # Compile
-arduino-cli compile \
-  --fqbn esp32:esp32:esp32c6:CDCOnBoot=cdc \
-  --output-dir /tmp/pump-build \
-  pump-controller-esp32.ino
+./build.sh
 
 # Upload
 arduino-cli upload -p /dev/cu.usbmodem* \
   --fqbn esp32:esp32:esp32c6:CDCOnBoot=cdc \
-  /tmp/pump-build/pump-controller-esp32.ino.bin
+  build/pump-controller-esp32.ino.bin
 ```
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| No serial output | CDCOnBoot not set | Recompile with `CDCOnBoot=cdc` in FQBN |
+| Device reboots every 60 s | Watchdog firing — loop stalled | Check WiFi/MQTT connectivity; syslog host reachable? |
+| Pumps blocked, won't start | Water level LOW | Check float / reed switch; inspect `water_level` topic |
+| Config set has no effect | Old single-topic approach | Publish to `config/set/<field>` not `config/set` |
+| HA shows firmware as `fw` | Old `value_json.fw` template | Update template to `value_json.fw_version` |
+| FOTA not triggering at ≥ v2.10 | Lexicographic version compare | Upgrade to v1.1.0+ which uses integer semver |
 
 ## Changelog
 
-### v1.0.1
-- Stop all running pumps immediately when water level transitions to LOW
+See [CHANGELOG.md](CHANGELOG.md).
 
-### v1.0.0
-- Water level sensor: NO reed switch + float/magnet with 2 s debounce
-- Pump start blocked and running pumps stopped when water is LOW
-- HA `binary_sensor` (device_class: problem) for water level
-- GPIO conflict detection at boot (warnings) and on save (rejected)
-- Water level pin configurable via portal and HA number entity
+## Licence
 
-### v0.1.0
-- Initial release: configurable N pumps (1–5), MQTT, captive portal, syslog, HA autodiscovery, FOTA, NTP, NVS config
-- Hard firmware safety cap on pump run time
-- Static IP / gateway / subnet / DNS configurable from HA
+[MIT](LICENSE)
