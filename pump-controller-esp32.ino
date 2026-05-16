@@ -61,7 +61,7 @@
 //  - MQTT callback safety: no publish() inside callback; deferred via flags
 // ═══════════════════════════════════════════════════════════
 
-#define FIRMWARE_VERSION "1.1.0-b02"
+#define FIRMWARE_VERSION "1.1.0-b03"
 
 // ── Hardware constants ────────────────────────────────────
 const int BTN_BOOT  = 9;      // Boot button — GPIO9 on Waveshare C6-Zero / XIAO C6
@@ -1761,8 +1761,10 @@ void setup() {
 
   // Watchdog — started after FOTA so the potentially long TLS download doesn't trip it.
   // 60 s covers the longest expected loop() operation (FOTA download: max FOTA_DL_TIMEOUT_MS).
+  // Arduino esp32 v3.x auto-inits the TWDT; reconfigure if already running.
   const esp_task_wdt_config_t wdtCfg = { .timeout_ms = 60000, .idle_core_mask = 0, .trigger_panic = true };
-  esp_task_wdt_init(&wdtCfg);
+  esp_err_t wdtErr = esp_task_wdt_init(&wdtCfg);
+  if (wdtErr == ESP_ERR_INVALID_STATE) esp_task_wdt_reconfigure(&wdtCfg);
   esp_task_wdt_add(NULL);
   logf("Watchdog  — started (60s timeout)\n");
   logf("Heap      — free: %u bytes (min: %u)\n", ESP.getFreeHeap(), ESP.getMinFreeHeap());
