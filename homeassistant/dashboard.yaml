@@ -1,0 +1,54 @@
+views:
+  - type: sections
+    sections:
+      - type: grid
+        cards:
+          - type: vertical-stack
+            title: Garden Pump Controller (1)
+            cards:
+              # Water level alert — shown prominently; binary_sensor device_class: problem
+              # payload_on: "LOW" (water low = problem ON), payload_off: "OK"
+              - type: entity
+                entity: binary_sensor.garden_pump_controller_1_water_level
+                name: Water Level
+                state_color: true
+              # Per-pump switches — default pumpCount is 1; add cards for pumps 2/3
+              # if more pumps are configured (entity will be unavailable until discovered)
+              - type: horizontal-stack
+                cards:
+                  - type: button
+                    entity: switch.garden_pump_controller_1_pump_1
+                    name: Pump 1
+                    icon: mdi:water-pump
+                    show_state: true
+                    tap_action:
+                      action: toggle
+                  - type: button
+                    entity: switch.garden_pump_controller_1_pump_2
+                    name: Pump 2
+                    icon: mdi:water-pump
+                    show_state: true
+                    tap_action:
+                      action: toggle
+                  - type: button
+                    entity: switch.garden_pump_controller_1_pump_3
+                    name: Pump 3
+                    icon: mdi:water-pump
+                    show_state: true
+                    tap_action:
+                      action: toggle
+              - type: custom:mushroom-chips-card
+                chips:
+                  - type: entity
+                    entity: sensor.garden_pump_controller_1_firmware_version
+                    icon: mdi:chip
+                    content_info: state
+        column_span: 1
+        background:
+          color: amber
+          opacity: 20
+    max_columns: 4
+    title: Pump Controller
+    icon: mdi:water-pump
+    cards: []
+    show_icon_and_title: true
