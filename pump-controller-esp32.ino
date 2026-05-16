@@ -46,7 +46,7 @@
 //  - MQTT callback safety: no publish() inside callback; deferred via flags
 // ═══════════════════════════════════════════════════════════
 
-#define FIRMWARE_VERSION "1.0.2-b02"
+#define FIRMWARE_VERSION "1.0.2-b03"
 
 // ── Hardware constants ────────────────────────────────────
 const int BTN_BOOT  = 9;      // Boot button — GPIO9 on Waveshare C6-Zero / XIAO C6
@@ -1461,9 +1461,6 @@ void checkForUpdate() {
   client.setHandshakeTimeout(FOTA_VERSION_TIMEOUT_MS / 1000);
 
   HTTPClient http;
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  http.setTimeout(FOTA_VERSION_TIMEOUT_MS);
-
   String remoteVersion;
   String binUrl;
 
@@ -1472,12 +1469,14 @@ void checkForUpdate() {
     // Returns the newest release including pre-releases (which
     // /releases/latest skips). Parse "tag_name" from the JSON array.
     http.begin(client, FOTA_RELEASES_API_URL);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    http.setTimeout(FOTA_VERSION_TIMEOUT_MS);
     http.addHeader("User-Agent", "pump-controller-esp32");
     http.addHeader("Accept",     "application/vnd.github.v3+json");
     int code = http.GET();
 
     if (code != 200) {
-      logf("FOTA      — API request failed (HTTP %d)\n", code);
+      logf("FOTA      — API request failed (HTTP %d): %s\n", code, FOTA_RELEASES_API_URL);
       http.end();
       return;
     }
@@ -1509,10 +1508,12 @@ void checkForUpdate() {
   } else {
     // ── Stable channel: version.txt from /releases/latest ─────
     http.begin(client, FOTA_VERSION_URL);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    http.setTimeout(FOTA_VERSION_TIMEOUT_MS);
     int code = http.GET();
 
     if (code != 200) {
-      logf("FOTA      — version check failed (HTTP %d)\n", code);
+      logf("FOTA      — version check failed (HTTP %d): %s\n", code, FOTA_VERSION_URL);
       http.end();
       return;
     }
