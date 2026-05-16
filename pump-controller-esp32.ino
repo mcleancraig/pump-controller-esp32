@@ -61,7 +61,7 @@
 //  - MQTT callback safety: no publish() inside callback; deferred via flags
 // ═══════════════════════════════════════════════════════════
 
-#define FIRMWARE_VERSION "1.1.0-b01"
+#define FIRMWARE_VERSION "1.1.0-b02"
 
 // ── Hardware constants ────────────────────────────────────
 const int BTN_BOOT  = 9;      // Boot button — GPIO9 on Waveshare C6-Zero / XIAO C6
@@ -1471,6 +1471,11 @@ bool mqttConnect() {
 
 // Compare "X.Y.Z" version strings numerically. Returns true if remote > local.
 // strcmp() gives wrong results once minor or patch version reaches 10+.
+// Compare version strings numerically. Returns true if remote > local.
+// Handles X.Y.Z and X.Y.Z-bNN (beta) suffixes:
+//   stable > beta of same version  (1.1.0 > 1.1.0-b02)
+//   higher beta > lower beta       (1.1.0-b02 > 1.1.0-b01)
+// strcmp() fails once any component reaches 10+.
 static bool isNewerVersion(const String& remote, const String& local) {
   int rMaj = 0, rMin = 0, rPatch = 0;
   int lMaj = 0, lMin = 0, lPatch = 0;
@@ -1478,7 +1483,14 @@ static bool isNewerVersion(const String& remote, const String& local) {
   sscanf(local.c_str(),  "%d.%d.%d", &lMaj, &lMin, &lPatch);
   if (rMaj != lMaj) return rMaj > lMaj;
   if (rMin != lMin) return rMin > lMin;
-  return rPatch > lPatch;
+  if (rPatch != lPatch) return rPatch > lPatch;
+  // Same triplet — compare -bNN suffix. No suffix = stable = highest.
+  const char* rB = strstr(remote.c_str(), "-b");
+  const char* lB = strstr(local.c_str(),  "-b");
+  if (!rB && !lB) return false;   // both stable, equal
+  if (!rB &&  lB) return true;    // remote stable, local beta → remote newer
+  if ( rB && !lB) return false;   // remote beta, local stable → not newer
+  return atoi(rB + 2) > atoi(lB + 2);  // both beta: compare number
 }
 
 void checkForUpdate() {
