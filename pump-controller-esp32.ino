@@ -1442,12 +1442,15 @@ bool mqttConnect() {
 // ═══════════════════════════════════════════════════════════
 
 void checkForUpdate() {
-  bool isBeta = strcmp(cfg.fwChannel, "beta") == 0;
-  bool isDev  = strchr(FIRMWARE_VERSION, '-') != nullptr;
+  bool isBeta     = strcmp(cfg.fwChannel, "beta") == 0;
+  bool isDev      = strchr(FIRMWARE_VERSION, '-') != nullptr;      // any non-release build
+  bool isDevBuild = strstr(FIRMWARE_VERSION, "-dev.") != nullptr;  // SHA dev builds only
 
-  // Stable channel: skip dev builds — no stable tag to compare against.
-  // Beta channel always checks — dev builds may be promoted to a beta tag.
-  if (!isBeta && isDev) {
+  // Stable channel: skip SHA dev builds only — no stable tag to compare against.
+  // Beta builds (-b01 etc.) must be allowed through so switching back to stable
+  // promotes them to the latest stable release automatically.
+  // Beta channel always checks — any build may be promoted to a beta or stable tag.
+  if (!isBeta && isDevBuild) {
     logf("FOTA      — skipped: dev build on stable channel (%s)\n", FIRMWARE_VERSION);
     return;
   }
