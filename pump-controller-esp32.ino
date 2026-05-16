@@ -9,8 +9,23 @@
 #include <WiFiClientSecure.h>
 #include <time.h>
 #include "esp_mac.h"
+#include "esp_system.h"
+#include "esp_task_wdt.h"
 
 // ═══════════════════════════════════════════════════════════
+//  v1.1.0
+//  - Cross-repo standardisation:
+//    hardware watchdog (60 s, panics on expiry);
+//    WiFi reconnect in loop();
+//    LWT — broker publishes "offline" to garden/pumpN/availability on disconnect;
+//    semver comparison fixed (strcmp fails when minor ≥ 10);
+//    MQTT client ID: pump-ctrl-N → garden-pumpN;
+//    config MQTT: single JSON topic → per-field wildcard (matches sensor pattern);
+//    HA discovery command_template removed, per-field command_topic used;
+//    state payload firmware_version → fw_version;
+//    water_level payload: plain string → JSON;
+//    WiFi.config() return checked; heap + reset-reason logging; FOTA throttle log.
+//
 //  v1.0.2
 //  - Fix pin conflict false positives: scope applyConfigUpdate() checks to
 //    cfg.pumpCount not MAX_PUMPS (inactive slots hold stale default GPIOs)
@@ -46,7 +61,7 @@
 //  - MQTT callback safety: no publish() inside callback; deferred via flags
 // ═══════════════════════════════════════════════════════════
 
-#define FIRMWARE_VERSION "1.0.3"
+#define FIRMWARE_VERSION "1.1.0-b03"
 
 // ── Hardware constants ────────────────────────────────────
 const int BTN_BOOT  = 9;      // Boot button — GPIO9 on Waveshare C6-Zero / XIAO C6
@@ -268,7 +283,7 @@ char UNIT_NAME[32];          // e.g. "Garden Pump Controller 1"
 char STATE_TOPIC[64];        // garden/pump1/state       (unit heartbeat)
 char CMD_TOPIC[64];          // garden/pump1/cmd         (unit commands: restart/reset)
 char PUMP_CMD_SUB[80];       // garden/pump1/pump/+/cmd  (wildcard subscription)
-char CONFIG_SET_TOPIC[80];   // garden/pump1/config/set
+char CONFIG_SET_PREFIX[80];   // garden/pump1/config/set
 char CONFIG_STATE_TOPIC[80]; // garden/pump1/config/state
 
 // Per-pump topics built on demand (pump index 0-based)
@@ -298,6 +313,7 @@ char DISC_CFG_PUMP_COUNT[128];
 // Water level sensor
 char WATER_LEVEL_TOPIC[64];
 char DISC_WATER_LEVEL[128];
+char AVAILABILITY_TOPIC[64]; // garden/pumpN/availability — LWT publishes "offline" here
 char DISC_CFG_WATER_PIN[128];
 char DISC_CFG_FW_CHANNEL[128];
 // Network config discovery topics
@@ -313,7 +329,7 @@ void buildDerivedConfig() {
   snprintf(STATE_TOPIC,        sizeof(STATE_TOPIC),        "garden/%s/state",           UNIT_ID);
   snprintf(CMD_TOPIC,          sizeof(CMD_TOPIC),          "garden/%s/cmd",             UNIT_ID);
   snprintf(PUMP_CMD_SUB,       sizeof(PUMP_CMD_SUB),       "garden/%s/pump/+/cmd",      UNIT_ID);
-  snprintf(CONFIG_SET_TOPIC,   sizeof(CONFIG_SET_TOPIC),   "garden/%s/config/set",      UNIT_ID);
+  snprintf(CONFIG_SET_PREFIX,   sizeof(CONFIG_SET_PREFIX),   "garden/%s/config/set",      UNIT_ID);
   snprintf(CONFIG_STATE_TOPIC, sizeof(CONFIG_STATE_TOPIC), "garden/%s/config/state",    UNIT_ID);
 
   snprintf(DISC_BTN_RESTART, sizeof(DISC_BTN_RESTART),
@@ -342,6 +358,8 @@ void buildDerivedConfig() {
     "garden/%s/water_level",               UNIT_ID);
   snprintf(DISC_WATER_LEVEL,     sizeof(DISC_WATER_LEVEL),
     "%s/binary_sensor/%s_water_level/config", HA_DISCOVERY_PREFIX, UNIT_ID);
+  snprintf(AVAILABILITY_TOPIC,   sizeof(AVAILABILITY_TOPIC),
+    "garden/%s/availability",              UNIT_ID);
   snprintf(DISC_CFG_WATER_PIN,   sizeof(DISC_CFG_WATER_PIN),
     "%s/number/%s_cfg_water_pin/config",   HA_DISCOVERY_PREFIX, UNIT_ID);
   snprintf(DISC_CFG_FW_CHANNEL,  sizeof(DISC_CFG_FW_CHANNEL),
@@ -796,12 +814,13 @@ void handleNotFound() {
 bool connectWiFi() {
   logf("WiFi      — connecting to '%s'\n", cfg.wifiSSID);
   if (cfg.staticIP) {
-    WiFi.config(
-      IPAddress(cfg.ip[0],  cfg.ip[1],  cfg.ip[2],  cfg.ip[3]),
-      IPAddress(cfg.gw[0],  cfg.gw[1],  cfg.gw[2],  cfg.gw[3]),
-      IPAddress(cfg.sn[0],  cfg.sn[1],  cfg.sn[2],  cfg.sn[3]),
-      IPAddress(cfg.dns[0], cfg.dns[1], cfg.dns[2], cfg.dns[3])
-    );
+    if (!WiFi.config(
+          IPAddress(cfg.ip[0],  cfg.ip[1],  cfg.ip[2],  cfg.ip[3]),
+          IPAddress(cfg.gw[0],  cfg.gw[1],  cfg.gw[2],  cfg.gw[3]),
+          IPAddress(cfg.sn[0],  cfg.sn[1],  cfg.sn[2],  cfg.sn[3]),
+          IPAddress(cfg.dns[0], cfg.dns[1], cfg.dns[2], cfg.dns[3]))) {
+      logf("WiFi      — static IP config failed\n");
+    }
   }
   WiFi.mode(WIFI_STA);
   WiFi.begin(cfg.wifiSSID, cfg.wifiPassword);
@@ -924,7 +943,7 @@ static bool  pendingConfigUpdate = false;
 static bool  pendingFotaCheck   = false;
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  char msg[64];
+  char msg[128];
   int len = min((int)length, (int)sizeof(msg) - 1);
   memcpy(msg, payload, len);
   msg[len] = '\0';
@@ -936,9 +955,36 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     return;
   }
 
-  // Config update: garden/pumpN/config/set
-  if (strcmp(topic, CONFIG_SET_TOPIC) == 0) {
-    strlcpy(pendingConfigPayload, msg, sizeof(pendingConfigPayload));
+  // Per-field config update: garden/pumpN/config/set/<field>
+  // Build a minimal JSON string for applyConfigUpdate() to consume unchanged.
+  size_t prefixLen = strlen(CONFIG_SET_PREFIX);
+  if (strncmp(topic, CONFIG_SET_PREFIX, prefixLen) == 0 && topic[prefixLen] == '/') {
+    const char* field = topic + prefixLen + 1;
+
+    // String fields: value must be JSON-quoted
+    static const char* strFields[] = {
+      "mqttBroker", "mqttUser", "mqttPassword", "syslogHost", "fwChannel",
+      "ip", "gw", "sn", "dns", nullptr
+    };
+    bool isStr = false;
+    for (int i = 0; strFields[i]; i++) {
+      if (strcmp(field, strFields[i]) == 0) { isStr = true; break; }
+    }
+
+    if (strcmp(field, "staticIP") == 0) {
+      // HA switch sends "ON"/"OFF"; convert to JSON boolean
+      bool val = (strcasecmp(msg, "ON") == 0 || strcmp(msg, "true") == 0 || strcmp(msg, "1") == 0);
+      snprintf(pendingConfigPayload, sizeof(pendingConfigPayload),
+               "{\"staticIP\":%s}", val ? "true" : "false");
+    } else if (isStr) {
+      snprintf(pendingConfigPayload, sizeof(pendingConfigPayload),
+               "{\"%s\":\"%s\"}", field, msg);
+    } else {
+      // Integer fields: unitNumber, mqttPort, syslogPort, pumpCount,
+      // pumpPin0-4, pumpDuration0-4, waterLevelPin
+      snprintf(pendingConfigPayload, sizeof(pendingConfigPayload),
+               "{\"%s\":%s}", field, msg);
+    }
     pendingConfigUpdate = true;
     return;
   }
@@ -947,9 +993,9 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   // Extract pump index I from topic: "garden/pumpN/pump/I/cmd"
   char prefix[80];
   snprintf(prefix, sizeof(prefix), "garden/%s/pump/", UNIT_ID);
-  size_t prefixLen = strlen(prefix);
-  if (strncmp(topic, prefix, prefixLen) == 0) {
-    int pumpNumber = atoi(topic + prefixLen);   // 1-based
+  size_t pumpPrefixLen = strlen(prefix);
+  if (strncmp(topic, prefix, pumpPrefixLen) == 0) {
+    int pumpNumber = atoi(topic + pumpPrefixLen);   // 1-based
     int idx = pumpNumber - 1;                    // 0-based
     if (idx >= 0 && idx < cfg.pumpCount) {
       // Serial only — no logf/syslog inside MQTT callback
@@ -977,7 +1023,9 @@ static unsigned long waterLevelStableMs = 0;
 
 void publishWaterLevel() {
   if (cfg.waterLevelPin < 0) return;
-  mqtt.publish(WATER_LEVEL_TOPIC, waterLevelLow ? "LOW" : "OK", true);
+  char wlPayload[32];
+  snprintf(wlPayload, sizeof(wlPayload), "{\"water_level\":\"%s\"}", waterLevelLow ? "LOW" : "OK");
+  mqtt.publish(WATER_LEVEL_TOPIC, wlPayload, true);
 }
 
 void updateWaterLevel() {
@@ -1005,7 +1053,7 @@ void publishUnitState() {
   unsigned long uptimeSec = millis() / 1000;
   char payload[200];
   snprintf(payload, sizeof(payload),
-    "{\"firmware_version\":\"%s\",\"uptime_s\":%lu,\"rssi\":%d,\"pump_count\":%d}",
+    "{\"fw_version\":\"%s\",\"uptime_s\":%lu,\"rssi\":%d,\"pump_count\":%d}",
     FIRMWARE_VERSION, uptimeSec, WiFi.RSSI(), cfg.pumpCount);
   mqtt.publish(STATE_TOPIC, payload, false);
 }
@@ -1162,7 +1210,7 @@ void publishHADiscovery() {
   snprintf(payload, sizeof(payload),
     "{\"name\":\"Firmware Version\",\"unique_id\":\"%s_fw\","
     "\"state_topic\":\"%s\","
-    "\"value_template\":\"{{value_json.firmware_version}}\","
+    "\"value_template\":\"{{value_json.fw_version}}\","
     "\"entity_category\":\"diagnostic\",%s}",
     UNIT_ID, STATE_TOPIC, dev);
   mqtt.publish(DISC_FW, payload, true);
@@ -1207,167 +1255,144 @@ void publishHADiscovery() {
     mqtt.publish(discTopic, payload, true);
   }
 
-  // ── Config: MQTT broker ───────────────────────────────────
+  // ── Config entities — per-field command topics (no command_template) ──────
+  // Each entity's command_topic is CONFIG_SET_PREFIX/fieldName.
+  // The MQTT callback extracts the field name from the topic suffix and builds
+  // a minimal JSON string for applyConfigUpdate() to parse unchanged.
+
+  char cmdTopic[96];
+
+  snprintf(cmdTopic, sizeof(cmdTopic), "%s/mqttBroker", CONFIG_SET_PREFIX);
   snprintf(payload, sizeof(payload),
     "{\"name\":\"MQTT Broker\",\"unique_id\":\"%s_cfg_mqtt_broker\","
-    "\"state_topic\":\"%s\","
-    "\"value_template\":\"{{value_json.mqttBroker}}\","
-    "\"command_topic\":\"%s\",\"command_template\":\"{\\\"mqttBroker\\\":\\\"{{value}}\\\"}\","
-    "\"entity_category\":\"config\",%s}",
-    UNIT_ID, CONFIG_STATE_TOPIC, CONFIG_SET_TOPIC, dev);
+    "\"state_topic\":\"%s\",\"value_template\":\"{{value_json.mqttBroker}}\","
+    "\"command_topic\":\"%s\",\"entity_category\":\"config\",%s}",
+    UNIT_ID, CONFIG_STATE_TOPIC, cmdTopic, dev);
   mqtt.publish(DISC_CFG_MQTT_BROKER, payload, true);
 
-  // ── Config: MQTT port ─────────────────────────────────────
+  snprintf(cmdTopic, sizeof(cmdTopic), "%s/mqttPort", CONFIG_SET_PREFIX);
   snprintf(payload, sizeof(payload),
     "{\"name\":\"MQTT Port\",\"unique_id\":\"%s_cfg_mqtt_port\","
-    "\"state_topic\":\"%s\","
-    "\"value_template\":\"{{value_json.mqttPort}}\","
-    "\"command_topic\":\"%s\",\"command_template\":\"{\\\"mqttPort\\\":{{value}}}\","
-    "\"min\":1,\"max\":65535,\"mode\":\"box\","
+    "\"state_topic\":\"%s\",\"value_template\":\"{{value_json.mqttPort}}\","
+    "\"command_topic\":\"%s\",\"min\":1,\"max\":65535,\"mode\":\"box\","
     "\"entity_category\":\"config\",%s}",
-    UNIT_ID, CONFIG_STATE_TOPIC, CONFIG_SET_TOPIC, dev);
+    UNIT_ID, CONFIG_STATE_TOPIC, cmdTopic, dev);
   mqtt.publish(DISC_CFG_MQTT_PORT, payload, true);
 
-  // ── Config: MQTT user ─────────────────────────────────────
+  snprintf(cmdTopic, sizeof(cmdTopic), "%s/mqttUser", CONFIG_SET_PREFIX);
   snprintf(payload, sizeof(payload),
     "{\"name\":\"MQTT User\",\"unique_id\":\"%s_cfg_mqtt_user\","
-    "\"state_topic\":\"%s\","
-    "\"value_template\":\"{{value_json.mqttUser}}\","
-    "\"command_topic\":\"%s\",\"command_template\":\"{\\\"mqttUser\\\":\\\"{{value}}\\\"}\","
-    "\"entity_category\":\"config\",%s}",
-    UNIT_ID, CONFIG_STATE_TOPIC, CONFIG_SET_TOPIC, dev);
+    "\"state_topic\":\"%s\",\"value_template\":\"{{value_json.mqttUser}}\","
+    "\"command_topic\":\"%s\",\"entity_category\":\"config\",%s}",
+    UNIT_ID, CONFIG_STATE_TOPIC, cmdTopic, dev);
   mqtt.publish(DISC_CFG_MQTT_USER, payload, true);
 
-  // ── Config: MQTT password ─────────────────────────────────
+  snprintf(cmdTopic, sizeof(cmdTopic), "%s/mqttPassword", CONFIG_SET_PREFIX);
   snprintf(payload, sizeof(payload),
     "{\"name\":\"MQTT Password\",\"unique_id\":\"%s_cfg_mqtt_pass\","
-    "\"state_topic\":\"%s\","
-    "\"value_template\":\"{{value_json.mqttPassword}}\","
-    "\"command_topic\":\"%s\",\"command_template\":\"{\\\"mqttPassword\\\":\\\"{{value}}\\\"}\","
-    "\"entity_category\":\"config\",%s}",
-    UNIT_ID, CONFIG_STATE_TOPIC, CONFIG_SET_TOPIC, dev);
+    "\"state_topic\":\"%s\",\"value_template\":\"{{value_json.mqttPassword}}\","
+    "\"command_topic\":\"%s\",\"entity_category\":\"config\",%s}",
+    UNIT_ID, CONFIG_STATE_TOPIC, cmdTopic, dev);
   mqtt.publish(DISC_CFG_MQTT_PASS, payload, true);
 
-  // ── Config: syslog host ───────────────────────────────────
+  snprintf(cmdTopic, sizeof(cmdTopic), "%s/syslogHost", CONFIG_SET_PREFIX);
   snprintf(payload, sizeof(payload),
     "{\"name\":\"Syslog Host\",\"unique_id\":\"%s_cfg_syslog_host\","
-    "\"state_topic\":\"%s\","
-    "\"value_template\":\"{{value_json.syslogHost}}\","
-    "\"command_topic\":\"%s\",\"command_template\":\"{\\\"syslogHost\\\":\\\"{{value}}\\\"}\","
-    "\"entity_category\":\"config\",%s}",
-    UNIT_ID, CONFIG_STATE_TOPIC, CONFIG_SET_TOPIC, dev);
+    "\"state_topic\":\"%s\",\"value_template\":\"{{value_json.syslogHost}}\","
+    "\"command_topic\":\"%s\",\"entity_category\":\"config\",%s}",
+    UNIT_ID, CONFIG_STATE_TOPIC, cmdTopic, dev);
   mqtt.publish(DISC_CFG_SYSLOG_HOST, payload, true);
 
-  // ── Config: syslog port ───────────────────────────────────
+  snprintf(cmdTopic, sizeof(cmdTopic), "%s/syslogPort", CONFIG_SET_PREFIX);
   snprintf(payload, sizeof(payload),
     "{\"name\":\"Syslog Port\",\"unique_id\":\"%s_cfg_syslog_port\","
-    "\"state_topic\":\"%s\","
-    "\"value_template\":\"{{value_json.syslogPort}}\","
-    "\"command_topic\":\"%s\",\"command_template\":\"{\\\"syslogPort\\\":{{value}}}\","
-    "\"min\":1,\"max\":65535,\"mode\":\"box\","
+    "\"state_topic\":\"%s\",\"value_template\":\"{{value_json.syslogPort}}\","
+    "\"command_topic\":\"%s\",\"min\":1,\"max\":65535,\"mode\":\"box\","
     "\"entity_category\":\"config\",%s}",
-    UNIT_ID, CONFIG_STATE_TOPIC, CONFIG_SET_TOPIC, dev);
+    UNIT_ID, CONFIG_STATE_TOPIC, cmdTopic, dev);
   mqtt.publish(DISC_CFG_SYSLOG_PORT, payload, true);
 
-  // ── Config: pump count ────────────────────────────────────
+  snprintf(cmdTopic, sizeof(cmdTopic), "%s/pumpCount", CONFIG_SET_PREFIX);
   snprintf(payload, sizeof(payload),
     "{\"name\":\"Pump Count\",\"unique_id\":\"%s_cfg_pump_count\","
-    "\"state_topic\":\"%s\","
-    "\"value_template\":\"{{value_json.pumpCount}}\","
-    "\"command_topic\":\"%s\",\"command_template\":\"{\\\"pumpCount\\\":{{value}}}\","
-    "\"min\":1,\"max\":5,\"mode\":\"box\","
+    "\"state_topic\":\"%s\",\"value_template\":\"{{value_json.pumpCount}}\","
+    "\"command_topic\":\"%s\",\"min\":1,\"max\":5,\"mode\":\"box\","
     "\"entity_category\":\"config\",%s}",
-    UNIT_ID, CONFIG_STATE_TOPIC, CONFIG_SET_TOPIC, dev);
+    UNIT_ID, CONFIG_STATE_TOPIC, cmdTopic, dev);
   mqtt.publish(DISC_CFG_PUMP_COUNT, payload, true);
 
   // ── Config: per-pump GPIO pin and duration ────────────────
   for (int i = 0; i < cfg.pumpCount; i++) {
-    char discPin[128], discDur[128];
+    char discPin[128], discDur[128], cmdPin[96], cmdDur[96];
     snprintf(discPin, sizeof(discPin),
       "%s/number/%s_cfg_pump%d_pin/config", HA_DISCOVERY_PREFIX, UNIT_ID, i + 1);
     snprintf(discDur, sizeof(discDur),
       "%s/number/%s_cfg_pump%d_dur/config", HA_DISCOVERY_PREFIX, UNIT_ID, i + 1);
+    snprintf(cmdPin, sizeof(cmdPin), "%s/pumpPin%d", CONFIG_SET_PREFIX, i);
+    snprintf(cmdDur, sizeof(cmdDur), "%s/pumpDuration%d", CONFIG_SET_PREFIX, i);
 
     snprintf(payload, sizeof(payload),
       "{\"name\":\"Pump %d GPIO Pin\",\"unique_id\":\"%s_cfg_pump%d_pin\","
-      "\"state_topic\":\"%s\","
-      "\"value_template\":\"{{value_json.pumpPins[%d]}}\","
-      "\"command_topic\":\"%s\",\"command_template\":\"{\\\"pumpPin%d\\\":{{value}}}\","
-      "\"min\":0,\"max\":28,\"mode\":\"box\","
+      "\"state_topic\":\"%s\",\"value_template\":\"{{value_json.pumpPins[%d]}}\","
+      "\"command_topic\":\"%s\",\"min\":0,\"max\":28,\"mode\":\"box\","
       "\"entity_category\":\"config\",%s}",
       i + 1, UNIT_ID, i + 1,
-      CONFIG_STATE_TOPIC, i,
-      CONFIG_SET_TOPIC, i,
-      dev);
+      CONFIG_STATE_TOPIC, i, cmdPin, dev);
     mqtt.publish(discPin, payload, true);
 
     snprintf(payload, sizeof(payload),
       "{\"name\":\"Pump %d Duration (s)\",\"unique_id\":\"%s_cfg_pump%d_dur\","
-      "\"state_topic\":\"%s\","
-      "\"value_template\":\"{{value_json.pumpDurations[%d]}}\","
-      "\"command_topic\":\"%s\",\"command_template\":\"{\\\"pumpDuration%d\\\":{{value}}}\","
-      "\"min\":1,\"max\":%d,\"mode\":\"box\","
+      "\"state_topic\":\"%s\",\"value_template\":\"{{value_json.pumpDurations[%d]}}\","
+      "\"command_topic\":\"%s\",\"min\":1,\"max\":%d,\"mode\":\"box\","
       "\"entity_category\":\"config\",%s}",
       i + 1, UNIT_ID, i + 1,
-      CONFIG_STATE_TOPIC, i,
-      CONFIG_SET_TOPIC, i,
-      PUMP_MAX_DURATION_S,
-      dev);
+      CONFIG_STATE_TOPIC, i, cmdDur, PUMP_MAX_DURATION_S, dev);
     mqtt.publish(discDur, payload, true);
   }
 
   // ── Water level sensor ────────────────────────────────────
-  // Binary sensor — ON (problem) = water low, OFF = OK.
-  // Published only when a pin is configured; cleared (empty retained) when disabled.
   if (cfg.waterLevelPin >= 0) {
     snprintf(payload, sizeof(payload),
       "{\"name\":\"Water Level\",\"unique_id\":\"%s_water_level\","
       "\"state_topic\":\"%s\","
+      "\"value_template\":\"{{value_json.water_level}}\","
       "\"payload_on\":\"LOW\",\"payload_off\":\"OK\","
       "\"device_class\":\"problem\","
       "\"icon\":\"mdi:water-alert\",%s}",
       UNIT_ID, WATER_LEVEL_TOPIC, dev);
   } else {
-    payload[0] = '\0';  // empty payload un-publishes any previous retained entity
+    payload[0] = '\0';
   }
   mqtt.publish(DISC_WATER_LEVEL, payload, true);
 
-  // Config: water level pin (-1 = disabled, 0-28 = GPIO)
+  snprintf(cmdTopic, sizeof(cmdTopic), "%s/waterLevelPin", CONFIG_SET_PREFIX);
   snprintf(payload, sizeof(payload),
     "{\"name\":\"Water Level Pin\",\"unique_id\":\"%s_cfg_water_pin\","
-    "\"state_topic\":\"%s\","
-    "\"value_template\":\"{{value_json.waterLevelPin}}\","
-    "\"command_topic\":\"%s\",\"command_template\":\"{\\\"waterLevelPin\\\":{{value}}}\","
-    "\"min\":-1,\"max\":28,\"mode\":\"box\","
-    "\"icon\":\"mdi:electric-switch\","
-    "\"entity_category\":\"config\",%s}",
-    UNIT_ID, CONFIG_STATE_TOPIC, CONFIG_SET_TOPIC, dev);
+    "\"state_topic\":\"%s\",\"value_template\":\"{{value_json.waterLevelPin}}\","
+    "\"command_topic\":\"%s\",\"min\":-1,\"max\":28,\"mode\":\"box\","
+    "\"icon\":\"mdi:electric-switch\",\"entity_category\":\"config\",%s}",
+    UNIT_ID, CONFIG_STATE_TOPIC, cmdTopic, dev);
   mqtt.publish(DISC_CFG_WATER_PIN, payload, true);
 
-  // ── Update channel select ────────────────────────────────
+  snprintf(cmdTopic, sizeof(cmdTopic), "%s/fwChannel", CONFIG_SET_PREFIX);
   snprintf(payload, sizeof(payload),
     "{\"name\":\"Update Channel\",\"unique_id\":\"%s_cfg_fw_channel\","
-    "\"state_topic\":\"%s\","
-    "\"value_template\":\"{{value_json.fwChannel}}\","
-    "\"command_topic\":\"%s\","
-    "\"command_template\":\"{\\\"fwChannel\\\":\\\"{{value}}\\\"}\","
-    "\"options\":[\"stable\",\"beta\"],"
-    "\"entity_category\":\"config\","
-    "\"icon\":\"mdi:update\",%s}",
-    UNIT_ID, CONFIG_STATE_TOPIC, CONFIG_SET_TOPIC, dev);
+    "\"state_topic\":\"%s\",\"value_template\":\"{{value_json.fwChannel}}\","
+    "\"command_topic\":\"%s\",\"options\":[\"stable\",\"beta\"],"
+    "\"entity_category\":\"config\",\"icon\":\"mdi:update\",%s}",
+    UNIT_ID, CONFIG_STATE_TOPIC, cmdTopic, dev);
   mqtt.publish(DISC_CFG_FW_CHANNEL, payload, true);
 
-  // ── Network config ────────────────────────────────────────
-  // Static IP switch — payload_on/off are raw JSON sent to config/set topic
+  // Static IP switch — HA sends "ON"/"OFF"; callback converts to JSON boolean
+  snprintf(cmdTopic, sizeof(cmdTopic), "%s/staticIP", CONFIG_SET_PREFIX);
   snprintf(payload, sizeof(payload),
     "{\"name\":\"Static IP\",\"unique_id\":\"%s_cfg_static_ip\","
     "\"state_topic\":\"%s\","
     "\"value_template\":\"{%% if value_json.staticIP %%}ON{%% else %%}OFF{%% endif %%}\","
     "\"command_topic\":\"%s\","
-    "\"payload_on\":\"{\\\"staticIP\\\":true}\","
-    "\"payload_off\":\"{\\\"staticIP\\\":false}\","
+    "\"payload_on\":\"ON\",\"payload_off\":\"OFF\","
     "\"entity_category\":\"config\",%s}",
-    UNIT_ID, CONFIG_STATE_TOPIC, CONFIG_SET_TOPIC, dev);
+    UNIT_ID, CONFIG_STATE_TOPIC, cmdTopic, dev);
   mqtt.publish(DISC_CFG_STATIC_IP, payload, true);
 
   // IP address, gateway, subnet mask, DNS — text entities
@@ -1378,17 +1403,13 @@ void publishHADiscovery() {
     { "DNS Server",  "cfg_dns", "dns", DISC_CFG_DNS },
   };
   for (auto& f : netFields) {
+    snprintf(cmdTopic, sizeof(cmdTopic), "%s/%s", CONFIG_SET_PREFIX, f.key);
     snprintf(payload, sizeof(payload),
       "{\"name\":\"%s\",\"unique_id\":\"%s_%s\","
-      "\"state_topic\":\"%s\","
-      "\"value_template\":\"{{value_json.%s}}\","
-      "\"command_topic\":\"%s\","
-      "\"command_template\":\"{\\\"" "%s" "\\\":\\\"{{value}}\\\"}\","
-      "\"entity_category\":\"config\",%s}",
+      "\"state_topic\":\"%s\",\"value_template\":\"{{value_json.%s}}\","
+      "\"command_topic\":\"%s\",\"entity_category\":\"config\",%s}",
       f.name, UNIT_ID, f.uid,
-      CONFIG_STATE_TOPIC, f.key,
-      CONFIG_SET_TOPIC, f.key,
-      dev);
+      CONFIG_STATE_TOPIC, f.key, cmdTopic, dev);
     mqtt.publish(f.disc, payload, true);
   }
 
@@ -1404,15 +1425,17 @@ bool mqttConnect() {
   mqtt.setSocketTimeout(MQTT_TIMEOUT_S);
 
   char clientId[32];
-  snprintf(clientId, sizeof(clientId), "pump-ctrl-%d", cfg.unitNumber);
+  snprintf(clientId, sizeof(clientId), "garden-pump%d", cfg.unitNumber);
   logf("MQTT      — connecting to %s:%d as '%s'\n",
     cfg.mqttBroker, cfg.mqttPort, clientId);
 
   bool ok;
   if (strlen(cfg.mqttUser) > 0) {
-    ok = mqtt.connect(clientId, cfg.mqttUser, cfg.mqttPassword);
+    ok = mqtt.connect(clientId, cfg.mqttUser, cfg.mqttPassword,
+                      AVAILABILITY_TOPIC, 0, true, "offline");
   } else {
-    ok = mqtt.connect(clientId);
+    ok = mqtt.connect(clientId, nullptr, nullptr,
+                      AVAILABILITY_TOPIC, 0, true, "offline");
   }
 
   if (!ok) {
@@ -1421,11 +1444,16 @@ bool mqttConnect() {
   }
 
   logf("MQTT      — connected\n");
+  mqtt.publish(AVAILABILITY_TOPIC, "online", true);
 
   // Subscribe
+  char configWildcard[88];
+  snprintf(configWildcard, sizeof(configWildcard), "%s/+", CONFIG_SET_PREFIX);
   mqtt.subscribe(CMD_TOPIC);
   mqtt.subscribe(PUMP_CMD_SUB);
-  mqtt.subscribe(CONFIG_SET_TOPIC);
+  mqtt.subscribe(configWildcard);
+  logf("MQTT      — subscribed to %s, %s and %s\n",
+       CMD_TOPIC, PUMP_CMD_SUB, configWildcard);
 
   // Publish initial state
   publishHADiscovery();
@@ -1440,6 +1468,30 @@ bool mqttConnect() {
 // ═══════════════════════════════════════════════════════════
 //  FOTA
 // ═══════════════════════════════════════════════════════════
+
+// Compare "X.Y.Z" version strings numerically. Returns true if remote > local.
+// strcmp() gives wrong results once minor or patch version reaches 10+.
+// Compare version strings numerically. Returns true if remote > local.
+// Handles X.Y.Z and X.Y.Z-bNN (beta) suffixes:
+//   stable > beta of same version  (1.1.0 > 1.1.0-b02)
+//   higher beta > lower beta       (1.1.0-b02 > 1.1.0-b01)
+// strcmp() fails once any component reaches 10+.
+static bool isNewerVersion(const String& remote, const String& local) {
+  int rMaj = 0, rMin = 0, rPatch = 0;
+  int lMaj = 0, lMin = 0, lPatch = 0;
+  sscanf(remote.c_str(), "%d.%d.%d", &rMaj, &rMin, &rPatch);
+  sscanf(local.c_str(),  "%d.%d.%d", &lMaj, &lMin, &lPatch);
+  if (rMaj != lMaj) return rMaj > lMaj;
+  if (rMin != lMin) return rMin > lMin;
+  if (rPatch != lPatch) return rPatch > lPatch;
+  // Same triplet — compare -bNN suffix. No suffix = stable = highest.
+  const char* rB = strstr(remote.c_str(), "-b");
+  const char* lB = strstr(local.c_str(),  "-b");
+  if (!rB && !lB) return false;   // both stable, equal
+  if (!rB &&  lB) return true;    // remote stable, local beta → remote newer
+  if ( rB && !lB) return false;   // remote beta, local stable → not newer
+  return atoi(rB + 2) > atoi(lB + 2);  // both beta: compare number
+}
 
 void checkForUpdate() {
   bool isBeta     = strcmp(cfg.fwChannel, "beta") == 0;
@@ -1539,7 +1591,7 @@ void checkForUpdate() {
     bool remoteIsBeta = remoteVersion.indexOf("-b") >= 0;
     if (remoteIsBeta) {
       // dev→beta, beta→same-beta (no-op), beta→newer/older-beta
-      shouldUpdate = (remoteVersion != String(FIRMWARE_VERSION));
+      shouldUpdate = isNewerVersion(remoteVersion, String(FIRMWARE_VERSION));
     } else {
       // Remote is a stable release. Promote dev/beta builds; otherwise
       // update only if strictly newer.
@@ -1547,7 +1599,7 @@ void checkForUpdate() {
         logf("FOTA      — promoting dev/beta build to stable\n");
         shouldUpdate = true;
       } else {
-        shouldUpdate = strcmp(remoteVersion.c_str(), FIRMWARE_VERSION) > 0;
+        shouldUpdate = isNewerVersion(remoteVersion, String(FIRMWARE_VERSION));
       }
     }
   } else {
@@ -1620,7 +1672,7 @@ void checkBootButton() {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  logf("Boot      — %s\n", FIRMWARE_VERSION);
+  logf("Boot      — v%s reset_reason=%d\n", FIRMWARE_VERSION, (int)esp_reset_reason());
 
   pinMode(BTN_BOOT, INPUT_PULLUP);
 
@@ -1702,9 +1754,20 @@ void setup() {
 
   // FOTA check (once per boot)
   checkForUpdate();
+  logf("Heap      — free: %u bytes (min: %u)\n", ESP.getFreeHeap(), ESP.getMinFreeHeap());
 
   // MQTT initial connect
   mqttConnect();
+
+  // Watchdog — started after FOTA so the potentially long TLS download doesn't trip it.
+  // 60 s covers the longest expected loop() operation (FOTA download: max FOTA_DL_TIMEOUT_MS).
+  // Arduino esp32 v3.x auto-inits the TWDT; reconfigure if already running.
+  const esp_task_wdt_config_t wdtCfg = { .timeout_ms = 60000, .idle_core_mask = 0, .trigger_panic = true };
+  esp_err_t wdtErr = esp_task_wdt_init(&wdtCfg);
+  if (wdtErr == ESP_ERR_INVALID_STATE) esp_task_wdt_reconfigure(&wdtCfg);
+  esp_task_wdt_add(NULL);
+  logf("Watchdog  — started (60s timeout)\n");
+  logf("Heap      — free: %u bytes (min: %u)\n", ESP.getFreeHeap(), ESP.getMinFreeHeap());
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1716,6 +1779,24 @@ static unsigned long lastMqttAttempt = 0;
 static unsigned long lastFotaCheck   = 0;  // 0 = checked on boot via setup()
 
 void loop() {
+  esp_task_wdt_reset();
+
+  // ── WiFi reconnect ────────────────────────────────────────
+  if (WiFi.status() != WL_CONNECTED) {
+    logf("WiFi      — disconnected, reconnecting\n");
+    WiFi.disconnect();
+    WiFi.begin(cfg.wifiSSID, strlen(cfg.wifiPassword) > 0 ? cfg.wifiPassword : nullptr);
+    unsigned long wt = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - wt < WIFI_TIMEOUT_MS) delay(250);
+    if (WiFi.status() == WL_CONNECTED) {
+      logf("WiFi      — reconnected, IP: %s\n", WiFi.localIP().toString().c_str());
+      syslogFlush();
+    } else {
+      logf("WiFi      — reconnect failed\n");
+      return;
+    }
+  }
+
   // ── MQTT reconnect with cooldown ──────────────────────────
   if (!mqtt.connected()) {
     unsigned long now = millis();
@@ -1778,8 +1859,11 @@ void loop() {
         lastFotaCheck = millis();
         checkForUpdate();
       } else if (millis() - lastFotaCheck >= FOTA_CHECK_INTERVAL_MS) {
+        logf("FOTA      — checking (%.1fh since last check)\n",
+             (float)(millis() - lastFotaCheck) / 3600000.0f);
         lastFotaCheck = millis();
         checkForUpdate();
+        logf("Heap      — free: %u bytes (min: %u)\n", ESP.getFreeHeap(), ESP.getMinFreeHeap());
       }
     }
   }
