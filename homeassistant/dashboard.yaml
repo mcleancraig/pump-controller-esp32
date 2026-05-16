@@ -43,6 +43,10 @@ views:
                     entity: sensor.garden_pump_controller_1_firmware_version
                     icon: mdi:chip
                     content_info: state
+                  - type: entity
+                    entity: select.garden_pump_controller_1_update_channel
+                    icon: mdi:cellphone-arrow-down
+                    content_info: state
         column_span: 1
         background:
           color: amber
