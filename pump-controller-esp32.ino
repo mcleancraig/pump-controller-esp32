@@ -11,6 +11,16 @@
 #include "esp_mac.h"
 
 // ═══════════════════════════════════════════════════════════
+//  v1.0.2
+//  - Fix pin conflict false positives: scope applyConfigUpdate() checks to
+//    cfg.pumpCount not MAX_PUMPS (inactive slots hold stale default GPIOs)
+//  - Add raw pin check in pump auto-stop loop for immediate stop on water LOW
+//    (no debounce wait when a pump is running)
+//  - Default static IP: GW + DNS -> 192.168.1.1; IP -> 192.168.211.<unit>
+//  - Dual-channel FOTA: "stable" (default) and "beta" (-b01..99 tags)
+//    selectable from HA; beta uses GitHub API to find pre-release tags
+//  - fwChannel stored in NVS; exposed as HA select entity
+//
 //  v1.0.1
 //  - Stop all running pumps immediately when water level transitions to LOW
 //
@@ -69,12 +79,22 @@ const long  GMT_OFFSET_S = 0;
 const int   DST_OFFSET_S = 0;
 
 // ── FOTA ─────────────────────────────────────────────────
+// Stable channel: version.txt + binary from /releases/latest/download/
 const char* FOTA_VERSION_URL =
   "https://github.com/mcleancraig/pump-controller-esp32"
   "/releases/latest/download/version.txt";
 const char* FOTA_BIN_URL =
   "https://github.com/mcleancraig/pump-controller-esp32"
   "/releases/latest/download/pump-controller-esp32.ino.bin";
+// Beta channel: GitHub API /releases?per_page=1 returns the newest release
+// including pre-releases (which /releases/latest skips).
+const char* FOTA_RELEASES_API_URL =
+  "https://api.github.com/repos/mcleancraig/pump-controller-esp32"
+  "/releases?per_page=1";
+// Binary URL template for beta — tag substituted at runtime.
+const char* FOTA_BIN_URL_TMPL =
+  "https://github.com/mcleancraig/pump-controller-esp32"
+  "/releases/download/%s/pump-controller-esp32.ino.bin";
 
 // ── HA discovery prefix ───────────────────────────────────
 const char* HA_DISCOVERY_PREFIX = "homeassistant";
@@ -104,6 +124,7 @@ struct Config {
   int     pumpPin[MAX_PUMPS];           // GPIO pin for each pump
   int     pumpDuration[MAX_PUMPS];      // seconds to run on "water" command
   int     waterLevelPin;                // GPIO for NO reed switch; -1 = disabled
+  char    fwChannel[8];                 // "stable" (default) or "beta"
 } cfg;
 
 bool configLoaded = false;
@@ -173,6 +194,8 @@ void loadConfig() {
     cfg.pumpDuration[i] = prefs.getInt(keyDur, 5);
   }
   cfg.waterLevelPin = prefs.getInt("waterPin", -1);
+  prefs.getString("fwChannel", cfg.fwChannel, sizeof(cfg.fwChannel));
+  if (strlen(cfg.fwChannel) == 0) strlcpy(cfg.fwChannel, "stable", sizeof(cfg.fwChannel));
 
   prefs.end();
 
@@ -230,7 +253,8 @@ void saveConfig(const Config& c) {
     prefs.putInt(keyPin, c.pumpPin[i]);
     prefs.putInt(keyDur, c.pumpDuration[i]);
   }
-  prefs.putInt("waterPin", c.waterLevelPin);
+  prefs.putInt("waterPin",       c.waterLevelPin);
+  prefs.putString("fwChannel",  c.fwChannel);
   prefs.end();
   logf("Config    — saved to NVS\n");
 }
@@ -275,6 +299,7 @@ char DISC_CFG_PUMP_COUNT[128];
 char WATER_LEVEL_TOPIC[64];
 char DISC_WATER_LEVEL[128];
 char DISC_CFG_WATER_PIN[128];
+char DISC_CFG_FW_CHANNEL[128];
 // Network config discovery topics
 char DISC_CFG_STATIC_IP[128];
 char DISC_CFG_IP[128];
@@ -319,6 +344,8 @@ void buildDerivedConfig() {
     "%s/binary_sensor/%s_water_level/config", HA_DISCOVERY_PREFIX, UNIT_ID);
   snprintf(DISC_CFG_WATER_PIN,   sizeof(DISC_CFG_WATER_PIN),
     "%s/number/%s_cfg_water_pin/config",   HA_DISCOVERY_PREFIX, UNIT_ID);
+  snprintf(DISC_CFG_FW_CHANNEL,  sizeof(DISC_CFG_FW_CHANNEL),
+    "%s/select/%s_cfg_fw_channel/config",  HA_DISCOVERY_PREFIX, UNIT_ID);
 
   snprintf(DISC_CFG_STATIC_IP,   sizeof(DISC_CFG_STATIC_IP),
     "%s/switch/%s_cfg_static_ip/config",   HA_DISCOVERY_PREFIX, UNIT_ID);
@@ -1006,12 +1033,12 @@ void publishConfigState() {
     "\"syslogHost\":\"%s\",\"syslogPort\":%d,"
     "\"pumpCount\":%d,\"pumpPins\":%s,\"pumpDurations\":%s,"
     "\"staticIP\":%s,\"ip\":\"%s\",\"gw\":\"%s\",\"sn\":\"%s\",\"dns\":\"%s\","
-    "\"waterLevelPin\":%d}",
+    "\"waterLevelPin\":%d,\"fwChannel\":\"%s\"}",
     cfg.mqttBroker, cfg.mqttPort, cfg.mqttUser,
     cfg.syslogHost, cfg.syslogPort,
     cfg.pumpCount, pins, durs,
     cfg.staticIP ? "true" : "false", ipStr, gwStr, snStr, dnsStr,
-    cfg.waterLevelPin);
+    cfg.waterLevelPin, cfg.fwChannel);
   mqtt.publish(CONFIG_STATE_TOPIC, payload, true);
 }
 
@@ -1072,6 +1099,14 @@ void applyConfigUpdate(const char* json) {
   if (extractStr(json, "gw",  tmp, sizeof(tmp))) parseIP(tmp, cfg.gw);
   if (extractStr(json, "sn",  tmp, sizeof(tmp))) parseIP(tmp, cfg.sn);
   if (extractStr(json, "dns", tmp, sizeof(tmp))) parseIP(tmp, cfg.dns);
+  if (extractStr(json, "fwChannel", tmp, sizeof(tmp))) {
+    if (strcmp(tmp, "stable") == 0 || strcmp(tmp, "beta") == 0) {
+      strlcpy(cfg.fwChannel, tmp, sizeof(cfg.fwChannel));
+      logf("Config    — fwChannel -> %s\n", tmp);
+    } else {
+      logf("Config    — fwChannel rejected: must be 'stable' or 'beta'\n");
+    }
+  }
   if (extractInt(json, "waterLevelPin", &ival) && ival >= -1 && ival <= 28) {
     bool conflict = false;
     // Only check against active pump slots — inactive slots hold stale defaults
@@ -1305,6 +1340,19 @@ void publishHADiscovery() {
     UNIT_ID, CONFIG_STATE_TOPIC, CONFIG_SET_TOPIC, dev);
   mqtt.publish(DISC_CFG_WATER_PIN, payload, true);
 
+  // ── Update channel select ────────────────────────────────
+  snprintf(payload, sizeof(payload),
+    "{\"name\":\"Update Channel\",\"unique_id\":\"%s_cfg_fw_channel\","
+    "\"state_topic\":\"%s\","
+    "\"value_template\":\"{{value_json.fwChannel}}\","
+    "\"command_topic\":\"%s\","
+    "\"command_template\":\"{\\\"fwChannel\\\":\\\"{{value}}\\\"}\","
+    "\"options\":[\"stable\",\"beta\"],"
+    "\"entity_category\":\"config\","
+    "\"icon\":\"mdi:update\",%s}",
+    UNIT_ID, CONFIG_STATE_TOPIC, CONFIG_SET_TOPIC, dev);
+  mqtt.publish(DISC_CFG_FW_CHANNEL, payload, true);
+
   // ── Network config ────────────────────────────────────────
   // Static IP switch — payload_on/off are raw JSON sent to config/set topic
   snprintf(payload, sizeof(payload),
@@ -1390,16 +1438,21 @@ bool mqttConnect() {
 // ═══════════════════════════════════════════════════════════
 
 void checkForUpdate() {
-  // FOTA blocked on dev builds (version string contains '-')
-  if (strchr(FIRMWARE_VERSION, '-') != nullptr) {
-    logf("FOTA      — dev build, skipping\n");
+  bool isBeta = strcmp(cfg.fwChannel, "beta") == 0;
+  bool isDev  = strchr(FIRMWARE_VERSION, '-') != nullptr;
+
+  // Stable channel: skip dev builds — no stable tag to compare against.
+  // Beta channel always checks — dev builds may be promoted to a beta tag.
+  if (!isBeta && isDev) {
+    logf("FOTA      — skipped: dev build on stable channel (%s)\n", FIRMWARE_VERSION);
     return;
   }
 
-  logf("FOTA      — checking %s\n", FOTA_VERSION_URL);
+  logf("FOTA      — checking for update (%s channel)...\n",
+       isBeta ? "beta" : "stable");
 
   WiFiClientSecure client;
-  client.setInsecure();  // TODO: embed ISRG Root X1 for proper TLS validation
+  client.setInsecure();
   client.setTimeout(FOTA_VERSION_TIMEOUT_MS / 1000);
   client.setHandshakeTimeout(FOTA_VERSION_TIMEOUT_MS / 1000);
 
@@ -1407,53 +1460,133 @@ void checkForUpdate() {
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   http.setTimeout(FOTA_VERSION_TIMEOUT_MS);
 
-  if (!http.begin(client, FOTA_VERSION_URL)) {
-    logf("FOTA      — HTTP begin failed\n");
-    return;
-  }
+  String remoteVersion;
+  String binUrl;
 
-  int code = http.GET();
-  if (code != 200) {
-    logf("FOTA      — version check HTTP %d\n", code);
+  if (isBeta) {
+    // ── Beta channel: GitHub API /releases?per_page=1 ─────────
+    // Returns the newest release including pre-releases (which
+    // /releases/latest skips). Parse "tag_name" from the JSON array.
+    http.begin(client, FOTA_RELEASES_API_URL);
+    http.addHeader("User-Agent", "pump-controller-esp32");
+    http.addHeader("Accept",     "application/vnd.github.v3+json");
+    int code = http.GET();
+
+    if (code != 200) {
+      logf("FOTA      — API request failed (HTTP %d)\n", code);
+      http.end();
+      return;
+    }
+
+    String body = http.getString();
     http.end();
+
+    // Parse first "tag_name":"..." from the JSON array
+    int tagIdx = body.indexOf("\"tag_name\":\"");
+    if (tagIdx < 0) {
+      logf("FOTA      — no releases found in API response\n");
+      return;
+    }
+    int start = tagIdx + 12;   // skip past "tag_name":"
+    int end   = body.indexOf("\"", start);
+    if (end < 0) {
+      logf("FOTA      — malformed tag_name in API response\n");
+      return;
+    }
+    String tagFull = body.substring(start, end);  // e.g. "v1.0.2-b01"
+    remoteVersion = tagFull;
+    if (remoteVersion.startsWith("v")) remoteVersion = remoteVersion.substring(1);
+
+    // Construct binary download URL using the full tag (with 'v' if present)
+    char binBuf[220];
+    snprintf(binBuf, sizeof(binBuf), FOTA_BIN_URL_TMPL, tagFull.c_str());
+    binUrl = binBuf;
+
+  } else {
+    // ── Stable channel: version.txt from /releases/latest ─────
+    http.begin(client, FOTA_VERSION_URL);
+    int code = http.GET();
+
+    if (code != 200) {
+      logf("FOTA      — version check failed (HTTP %d)\n", code);
+      http.end();
+      return;
+    }
+
+    remoteVersion = http.getString();
+    remoteVersion.trim();
+    http.end();
+    binUrl = FOTA_BIN_URL;
+  }
+
+  logf("FOTA      — local: %s  remote: %s\n",
+       FIRMWARE_VERSION, remoteVersion.c_str());
+
+  // ── Decide whether to update ──────────────────────────────
+  bool shouldUpdate = false;
+  if (isBeta) {
+    // Beta: "different = update" ONLY when the API returned a pre-release
+    // (tag contains "-b"). If no beta exists yet, the API returns the latest
+    // stable — don't downgrade to it.
+    bool remoteIsBeta = remoteVersion.indexOf("-b") >= 0;
+    if (remoteIsBeta) {
+      // dev→beta, beta→same-beta (no-op), beta→newer/older-beta
+      shouldUpdate = (remoteVersion != String(FIRMWARE_VERSION));
+    } else {
+      // Remote is a stable release. Promote dev/beta builds; otherwise
+      // update only if strictly newer.
+      if (isDev) {
+        logf("FOTA      — promoting dev/beta build to stable\n");
+        shouldUpdate = true;
+      } else {
+        shouldUpdate = strcmp(remoteVersion.c_str(), FIRMWARE_VERSION) > 0;
+      }
+    }
+  } else {
+    // Stable: update only if remote is strictly newer.
+    shouldUpdate = strcmp(remoteVersion.c_str(), FIRMWARE_VERSION) > 0;
+    // Also promote dev/beta builds when switching channel back to stable.
+    if (!shouldUpdate && isDev && remoteVersion.length() > 0) {
+      logf("FOTA      — promoting dev/beta build to stable\n");
+      shouldUpdate = true;
+    }
+  }
+
+  if (!shouldUpdate) {
+    logf("FOTA      — firmware is current, no update needed\n");
     return;
   }
 
-  String remote = http.getString();
-  http.end();
-  remote.trim();
+  logf("FOTA      — update available: %s -> %s, downloading...\n",
+       FIRMWARE_VERSION, remoteVersion.c_str());
 
-  logf("FOTA      — local=%s remote=%s\n", FIRMWARE_VERSION, remote.c_str());
-
-  if (remote == FIRMWARE_VERSION) {
-    logf("FOTA      — up to date\n");
-    return;
-  }
-
-  // Stop all pumps before updating
+  // Stop all pumps and disconnect MQTT before flashing
   for (int i = 0; i < cfg.pumpCount; i++) stopPump(i);
-  mqtt.disconnect();
+  if (mqtt.connected()) mqtt.disconnect();
 
-  logf("FOTA      — updating to %s\n", remote.c_str());
-
-  WiFiClientSecure dlClient;
-  dlClient.setInsecure();
-  dlClient.setTimeout(FOTA_DL_TIMEOUT_MS / 1000);
-  dlClient.setHandshakeTimeout(FOTA_DL_TIMEOUT_MS / 1000);
+  // Extend timeouts for the binary download
+  client.setTimeout(FOTA_DL_TIMEOUT_MS / 1000);
+  client.setHandshakeTimeout(FOTA_DL_TIMEOUT_MS / 1000);
 
   httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  t_httpUpdate_return ret = httpUpdate.update(dlClient, FOTA_BIN_URL);
+  httpUpdate.onStart([]()      { logf("FOTA      — flashing...\n"); });
+  httpUpdate.onEnd([]()        { logf("FOTA      — flash complete\n"); });
+  httpUpdate.onError([](int e) { logf("FOTA      — error: %d\n", e); });
+  httpUpdate.onProgress([](int cur, int tot) {
+    Serial.printf("FOTA      — %d%%\r", (cur * 100) / tot);
+  });
 
-  switch (ret) {
+  t_httpUpdate_return result = httpUpdate.update(client, binUrl.c_str());
+
+  switch (result) {
     case HTTP_UPDATE_FAILED:
-      logf("FOTA      — update failed: %s\n", httpUpdate.getLastErrorString().c_str());
+      logf("FOTA      — failed: %s\n", httpUpdate.getLastErrorString().c_str());
       break;
     case HTTP_UPDATE_NO_UPDATES:
       logf("FOTA      — no update\n");
       break;
     case HTTP_UPDATE_OK:
-      logf("FOTA      — success, rebooting\n");
-      break;
+      break;  // device restarts automatically
   }
 }
 
