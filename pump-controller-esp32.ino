@@ -13,6 +13,15 @@
 #include "esp_task_wdt.h"
 
 // ═══════════════════════════════════════════════════════════
+//  v1.2.0
+//  - Piezo buzzer support: passive buzzer driven via LEDC PWM
+//    (arduino-esp32 v3 ledcAttach / ledcWriteTone).
+//    piezoPin configurable (default GPIO21, -1 = disabled).
+//    Alert patterns:
+//      Low water:        3 × 500ms low-tone (1100 Hz) beeps, 500ms gaps
+//      Watering started: 2 × 100ms high chirps (3550 Hz), 100ms gap
+//      Watering done:    1 high (3550 Hz, 150ms) + 1 low (1100 Hz, 150ms)
+//
 //  v1.1.0
 //  - Cross-repo standardisation:
 //    hardware watchdog (60 s, panics on expiry);
@@ -61,12 +70,13 @@
 //  - MQTT callback safety: no publish() inside callback; deferred via flags
 // ═══════════════════════════════════════════════════════════
 
-#define FIRMWARE_VERSION "1.1.0"
+#define FIRMWARE_VERSION "1.2.0"
 
 // ── Hardware constants ────────────────────────────────────
-const int BTN_BOOT  = 9;      // Boot button — GPIO9 on Waveshare C6-Zero / XIAO C6
-const int MAX_PUMPS = 5;
+const int BTN_BOOT          = 9;   // Boot button — GPIO9 on Waveshare C6-Zero / XIAO C6
+const int MAX_PUMPS         = 5;
 const int DEFAULT_PUMP_PINS[MAX_PUMPS] = { 1, 2, 3, 4, 5 };
+const int PIEZO_PIN_DEFAULT = 21;  // Passive piezo buzzer — GPIO21 (free on C6-Zero)
 
 // ── Safety cap ────────────────────────────────────────────
 // Firmware-enforced maximum run time. Cannot be raised via config or MQTT.
@@ -80,7 +90,7 @@ const int MQTT_TIMEOUT_S            = 5;
 const unsigned long MQTT_RECONNECT_COOLDOWN_MS = 5000;
 const unsigned long HEARTBEAT_INTERVAL_MS      = 30000;
 const unsigned long FOTA_CHECK_INTERVAL_MS     = 3600000UL;  // 1 hour
-const unsigned long WATER_DEBOUNCE_MS          = 2000;       // reed switch debounce
+const unsigned long WATER_DEBOUNCE_MS          = 1000;       // Hall / reed switch debounce
 const int NTP_TIMEOUT_MS            = 10000;
 const int FOTA_VERSION_TIMEOUT_MS   = 8000;
 const int FOTA_DL_TIMEOUT_MS        = 60000;
@@ -139,6 +149,7 @@ struct Config {
   int     pumpPin[MAX_PUMPS];           // GPIO pin for each pump
   int     pumpDuration[MAX_PUMPS];      // seconds to run on "water" command
   int     waterLevelPin;                // GPIO for NO reed switch; -1 = disabled
+  int     piezoPin;                     // GPIO for passive piezo buzzer; -1 = disabled
   char    fwChannel[8];                 // "stable" (default) or "beta"
 } cfg;
 
@@ -208,7 +219,8 @@ void loadConfig() {
     cfg.pumpPin[i]      = prefs.getInt(keyPin, DEFAULT_PUMP_PINS[i]);
     cfg.pumpDuration[i] = prefs.getInt(keyDur, 5);
   }
-  cfg.waterLevelPin = prefs.getInt("waterPin", -1);
+  cfg.waterLevelPin = prefs.getInt("waterPin",  -1);
+  cfg.piezoPin      = prefs.getInt("piezoPin",  PIEZO_PIN_DEFAULT);
   prefs.getString("fwChannel", cfg.fwChannel, sizeof(cfg.fwChannel));
   if (strlen(cfg.fwChannel) == 0) strlcpy(cfg.fwChannel, "stable", sizeof(cfg.fwChannel));
 
@@ -233,6 +245,14 @@ void validateConfig() {
       logf("Config    — WARNING: pump %d and water level sensor share GPIO%d\n",
         i + 1, cfg.waterLevelPin);
     }
+    if (cfg.piezoPin >= 0 && cfg.pumpPin[i] == cfg.piezoPin) {
+      logf("Config    — WARNING: pump %d and piezo buzzer share GPIO%d\n",
+        i + 1, cfg.piezoPin);
+    }
+  }
+  if (cfg.piezoPin >= 0 && cfg.waterLevelPin >= 0 && cfg.piezoPin == cfg.waterLevelPin) {
+    logf("Config    — WARNING: piezo buzzer and water level sensor share GPIO%d\n",
+      cfg.piezoPin);
   }
 }
 
@@ -269,6 +289,7 @@ void saveConfig(const Config& c) {
     prefs.putInt(keyDur, c.pumpDuration[i]);
   }
   prefs.putInt("waterPin",       c.waterLevelPin);
+  prefs.putInt("piezoPin",       c.piezoPin);
   prefs.putString("fwChannel",  c.fwChannel);
   prefs.end();
   logf("Config    — saved to NVS\n");
@@ -315,6 +336,7 @@ char WATER_LEVEL_TOPIC[64];
 char DISC_WATER_LEVEL[128];
 char AVAILABILITY_TOPIC[64]; // garden/pumpN/availability — LWT publishes "offline" here
 char DISC_CFG_WATER_PIN[128];
+char DISC_CFG_PIEZO_PIN[128];
 char DISC_CFG_FW_CHANNEL[128];
 // Network config discovery topics
 char DISC_CFG_STATIC_IP[128];
@@ -362,6 +384,8 @@ void buildDerivedConfig() {
     "garden/%s/availability",              UNIT_ID);
   snprintf(DISC_CFG_WATER_PIN,   sizeof(DISC_CFG_WATER_PIN),
     "%s/number/%s_cfg_water_pin/config",   HA_DISCOVERY_PREFIX, UNIT_ID);
+  snprintf(DISC_CFG_PIEZO_PIN,   sizeof(DISC_CFG_PIEZO_PIN),
+    "%s/number/%s_cfg_piezo_pin/config",   HA_DISCOVERY_PREFIX, UNIT_ID);
   snprintf(DISC_CFG_FW_CHANNEL,  sizeof(DISC_CFG_FW_CHANNEL),
     "%s/select/%s_cfg_fw_channel/config",  HA_DISCOVERY_PREFIX, UNIT_ID);
 
@@ -655,6 +679,14 @@ const char CONFIG_HTML[] PROGMEM = R"rawhtml(
       </label>
       <p class="hint">Normally-open reed switch with float and magnet. Float drops when tank is low, bringing the magnet to the reed and closing it (GPIO LOW = water low). Reed open (GPIO HIGH) = water OK. Set to -1 to disable.</p>
     </details>
+
+    <details>
+      <summary>Piezo buzzer <span class="optional">(optional)</span></summary>
+      <label style="margin-top:12px">Buzzer GPIO pin
+        <input type="number" name="piezoPin" value="21" min="-1" max="28">
+      </label>
+      <p class="hint">Passive piezo driven via LEDC PWM. Beeps on low water, watering started, and watering done events. Set to -1 to disable.</p>
+    </details>
   </div>
 
   <button type="submit">Save &amp; Restart</button>
@@ -781,6 +813,9 @@ void handleSave() {
   int waterPin = server.hasArg("waterPin") ? server.arg("waterPin").toInt() : -1;
   c.waterLevelPin = (waterPin >= -1 && waterPin <= 28) ? waterPin : -1;
 
+  int piezoPin = server.hasArg("piezoPin") ? server.arg("piezoPin").toInt() : PIEZO_PIN_DEFAULT;
+  c.piezoPin = (piezoPin >= -1 && piezoPin <= 28) ? piezoPin : PIEZO_PIN_DEFAULT;
+
   // Reject conflicting GPIO assignments
   for (int i = 0; i < c.pumpCount; i++) {
     for (int j = i + 1; j < c.pumpCount; j++) {
@@ -793,6 +828,13 @@ void handleSave() {
       server.send(400, "text/plain",
         "Pump " + String(i+1) + " and water level sensor share the same GPIO"); return;
     }
+    if (c.piezoPin >= 0 && c.pumpPin[i] == c.piezoPin) {
+      server.send(400, "text/plain",
+        "Pump " + String(i+1) + " and piezo buzzer share the same GPIO"); return;
+    }
+  }
+  if (c.piezoPin >= 0 && c.waterLevelPin >= 0 && c.piezoPin == c.waterLevelPin) {
+    server.send(400, "text/plain", "Piezo buzzer and water level sensor share the same GPIO"); return;
   }
 
   saveConfig(c);
@@ -884,7 +926,49 @@ static PumpSlot pumpSlot[MAX_PUMPS];
 // Forward declaration — defined with updateWaterLevel() below startPump().
 static bool waterLevelLow = false;
 
-void stopPump(int idx) {
+// ── Piezo buzzer ──────────────────────────────────────────
+// Blocking helpers — patterns are short (≤ 3 s total).
+// All are no-ops when cfg.piezoPin < 0.
+
+void buzz(int freq, int ms) {
+  if (cfg.piezoPin < 0) return;
+  ledcWriteTone(cfg.piezoPin, freq);
+  delay(ms);
+  ledcWriteTone(cfg.piezoPin, 0);
+}
+
+void buzzLowWater() {
+  // Three slow low-tone beeps: 500ms on, 500ms off
+  for (int i = 0; i < 3; i++) {
+    buzz(1100, 500);
+    if (i < 2) delay(500);
+  }
+}
+
+void buzzWateringStarted() {
+  // Two short high chirps: 100ms on, 100ms off
+  buzz(3550, 100);
+  delay(100);
+  buzz(3550, 100);
+}
+
+void buzzWateringDone() {
+  // One high then one low beep: 150ms each
+  buzz(3550, 150);
+  delay(50);
+  buzz(1100, 150);
+}
+
+void buzzBoot() {
+  // High → mid → low → mid → high: 80ms notes, 30ms gaps
+  const int notes[] = { 3550, 2200, 1100, 2200, 3550 };
+  for (int i = 0; i < 5; i++) {
+    buzz(notes[i], 80);
+    if (i < 4) delay(30);
+  }
+}
+
+void stopPump(int idx, bool doBuzz = true) {
   if (idx < 0 || idx >= MAX_PUMPS) return;
   bool wasRunning = pumpSlot[idx].running;
   pumpSlot[idx].running = false;
@@ -893,6 +977,7 @@ void stopPump(int idx) {
   }
   if (wasRunning) {
     logf("Pump %d   — stopped (GPIO%d LOW)\n", idx + 1, cfg.pumpPin[idx]);
+    if (doBuzz) buzzWateringDone();
   } else {
     logf("Pump %d   — stop requested but was already idle\n", idx + 1);
   }
@@ -910,6 +995,7 @@ void startPump(int idx) {
   pumpSlot[idx].durationMs = capDur * 1000;
   digitalWrite(cfg.pumpPin[idx], HIGH);
   logf("Pump %d   — started for %ds (GPIO%d)\n", idx + 1, capDur, cfg.pumpPin[idx]);
+  buzzWateringStarted();
 }
 
 void initPumpPins() {
@@ -1042,7 +1128,8 @@ void updateWaterLevel() {
   waterLevelLow = nowLow;
   if (waterLevelLow) {
     logf("Water     — LOW (reed closed, GPIO%d LOW)\n", cfg.waterLevelPin);
-    for (int i = 0; i < cfg.pumpCount; i++) stopPump(i);
+    for (int i = 0; i < cfg.pumpCount; i++) stopPump(i, false);
+    buzzLowWater();
   } else {
     logf("Water     — OK (reed open, GPIO%d HIGH)\n", cfg.waterLevelPin);
   }
@@ -1082,12 +1169,12 @@ void publishConfigState() {
     "\"syslogHost\":\"%s\",\"syslogPort\":%d,"
     "\"pumpCount\":%d,\"pumpPins\":%s,\"pumpDurations\":%s,"
     "\"staticIP\":%s,\"ip\":\"%s\",\"gw\":\"%s\",\"sn\":\"%s\",\"dns\":\"%s\","
-    "\"waterLevelPin\":%d,\"fwChannel\":\"%s\"}",
+    "\"waterLevelPin\":%d,\"piezoPin\":%d,\"fwChannel\":\"%s\"}",
     cfg.mqttBroker, cfg.mqttPort, cfg.mqttUser,
     cfg.syslogHost, cfg.syslogPort,
     cfg.pumpCount, pins, durs,
     cfg.staticIP ? "true" : "false", ipStr, gwStr, snStr, dnsStr,
-    cfg.waterLevelPin, cfg.fwChannel);
+    cfg.waterLevelPin, cfg.piezoPin, cfg.fwChannel);
   mqtt.publish(CONFIG_STATE_TOPIC, payload, true);
 }
 
@@ -1164,8 +1251,23 @@ void applyConfigUpdate(const char* json) {
     // Only check against active pump slots — inactive slots hold stale defaults
     for (int i = 0; i < cfg.pumpCount && !conflict; i++)
       if (ival >= 0 && cfg.pumpPin[i] == ival) conflict = true;
-    if (!conflict) cfg.waterLevelPin = ival;
-    else logf("Config    — waterLevelPin %d rejected (conflicts with pump pin)\n", ival);
+    if (!conflict && !(ival >= 0 && ival == cfg.piezoPin)) cfg.waterLevelPin = ival;
+    else logf("Config    — waterLevelPin %d rejected (conflicts with existing pin)\n", ival);
+  }
+  if (extractInt(json, "piezoPin", &ival) && ival >= -1 && ival <= 28) {
+    bool conflict = false;
+    for (int i = 0; i < cfg.pumpCount && !conflict; i++)
+      if (ival >= 0 && cfg.pumpPin[i] == ival) conflict = true;
+    if (ival >= 0 && ival == cfg.waterLevelPin) conflict = true;
+    if (!conflict) {
+      cfg.piezoPin = ival;
+      if (ival >= 0) {
+        ledcAttach(cfg.piezoPin, 2000, 8);
+        logf("Config    — piezoPin -> GPIO%d, LEDC re-attached\n", ival);
+      }
+    } else {
+      logf("Config    — piezoPin %d rejected (conflicts with existing pin)\n", ival);
+    }
   }
 
   for (int i = 0; i < MAX_PUMPS; i++) {
@@ -1373,6 +1475,15 @@ void publishHADiscovery() {
     "\"icon\":\"mdi:electric-switch\",\"entity_category\":\"config\",%s}",
     UNIT_ID, CONFIG_STATE_TOPIC, cmdTopic, dev);
   mqtt.publish(DISC_CFG_WATER_PIN, payload, true);
+
+  snprintf(cmdTopic, sizeof(cmdTopic), "%s/piezoPin", CONFIG_SET_PREFIX);
+  snprintf(payload, sizeof(payload),
+    "{\"name\":\"Piezo Buzzer Pin\",\"unique_id\":\"%s_cfg_piezo_pin\","
+    "\"state_topic\":\"%s\",\"value_template\":\"{{value_json.piezoPin}}\","
+    "\"command_topic\":\"%s\",\"min\":-1,\"max\":28,\"mode\":\"box\","
+    "\"icon\":\"mdi:bell\",\"entity_category\":\"config\",%s}",
+    UNIT_ID, CONFIG_STATE_TOPIC, cmdTopic, dev);
+  mqtt.publish(DISC_CFG_PIEZO_PIN, payload, true);
 
   snprintf(cmdTopic, sizeof(cmdTopic), "%s/fwChannel", CONFIG_SET_PREFIX);
   snprintf(payload, sizeof(payload),
@@ -1621,7 +1732,7 @@ void checkForUpdate() {
        FIRMWARE_VERSION, remoteVersion.c_str());
 
   // Stop all pumps and disconnect MQTT before flashing
-  for (int i = 0; i < cfg.pumpCount; i++) stopPump(i);
+  for (int i = 0; i < cfg.pumpCount; i++) stopPump(i, false);
   if (mqtt.connected()) mqtt.disconnect();
 
   // Extend timeouts for the binary download
@@ -1700,6 +1811,13 @@ void setup() {
     waterLevelLow = (waterLevelPinLast == LOW);
     logf("Water     — pin GPIO%d, initial state: %s\n",
       cfg.waterLevelPin, waterLevelLow ? "LOW" : "OK");
+  }
+
+  // Piezo buzzer — attach LEDC channel to pin for PWM tone generation.
+  if (cfg.piezoPin >= 0) {
+    ledcAttach(cfg.piezoPin, 2000, 8);
+    logf("Piezo     — attached to GPIO%d\n", cfg.piezoPin);
+    buzzBoot();
   }
 
   checkBootButton();
@@ -1833,7 +1951,7 @@ void loop() {
     } else if (cfg.waterLevelPin >= 0 && digitalRead(cfg.waterLevelPin) == LOW) {
       // Raw pin check — no debounce — so a running pump is cut immediately
       // when the reed closes, regardless of where the debounced state machine is.
-      stopPump(i);
+      stopPump(i, false);  // buzz handled by updateWaterLevel() / buzzLowWater()
       logf("Pump %d   — stopped (water LOW, raw pin)\n", i + 1);
       if (mqtt.connected()) publishPumpState(i);
     }
@@ -1877,7 +1995,7 @@ void loop() {
   // ── Deferred restart ──────────────────────────────────────
   if (pendingRestart) {
     logf("Cmd       — restarting\n");
-    for (int i = 0; i < cfg.pumpCount; i++) stopPump(i);
+    for (int i = 0; i < cfg.pumpCount; i++) stopPump(i, false);
     if (mqtt.connected()) mqtt.disconnect();
     delay(500);
     ESP.restart();
@@ -1886,7 +2004,7 @@ void loop() {
   // ── Deferred config wipe ──────────────────────────────────
   if (pendingReset) {
     logf("Cmd       — wiping config and restarting into portal\n");
-    for (int i = 0; i < cfg.pumpCount; i++) stopPump(i);
+    for (int i = 0; i < cfg.pumpCount; i++) stopPump(i, false);
     if (mqtt.connected()) mqtt.disconnect();
     clearConfig();
     delay(500);
