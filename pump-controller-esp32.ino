@@ -959,6 +959,15 @@ void buzzWateringDone() {
   buzz(1100, 150);
 }
 
+void buzzBoot() {
+  // High → mid → low → mid → high: 80ms notes, 30ms gaps
+  const int notes[] = { 3550, 2200, 1100, 2200, 3550 };
+  for (int i = 0; i < 5; i++) {
+    buzz(notes[i], 80);
+    if (i < 4) delay(30);
+  }
+}
+
 void stopPump(int idx, bool doBuzz = true) {
   if (idx < 0 || idx >= MAX_PUMPS) return;
   bool wasRunning = pumpSlot[idx].running;
@@ -1808,6 +1817,7 @@ void setup() {
   if (cfg.piezoPin >= 0) {
     ledcAttach(cfg.piezoPin, 2000, 8);
     logf("Piezo     — attached to GPIO%d\n", cfg.piezoPin);
+    buzzBoot();
   }
 
   checkBootButton();
