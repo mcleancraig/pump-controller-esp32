@@ -82,7 +82,7 @@
 //  - MQTT callback safety: no publish() inside callback; deferred via flags
 // ═══════════════════════════════════════════════════════════
 
-#define FIRMWARE_VERSION "1.3.0-dev.73b966a"
+#define FIRMWARE_VERSION "1.3.0-dev.ef7218a"
 
 // ── Hardware constants ────────────────────────────────────
 const int BTN_BOOT          = 9;   // Boot button — GPIO9 on Waveshare C6-Zero / XIAO C6
