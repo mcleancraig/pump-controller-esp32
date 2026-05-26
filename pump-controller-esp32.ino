@@ -17,7 +17,7 @@
 // ═══════════════════════════════════════════════════════════
 //  v1.3.0
 //  - Replace Hall/reed binary water sensor with VL53L0X ToF distance sensor.
-//    Sensor on Wire1 (SDA=GPIO6, SCL=GPIO7 — Wire1 defaults on ESP32-C6-Zero).
+//    Sensor on Wire (SDA=GPIO14, SCL=GPIO15 — Wire defaults on ESP32-C6-Zero).
 //    Drop-in swap to VL53L1X: change include + class name only.
 //    waterLevelPin repurposed as enable flag (-1=disabled, ≥0=enabled).
 //    waterFullMm / waterEmptyMm configurable via HA, portal, MQTT.
@@ -263,7 +263,7 @@ void validateConfig() {
     }
   }
   // Note: waterLevelPin is now an enable flag (not a GPIO), so no pin conflict check.
-  // VL53L0X is on Wire1 (SDA=GPIO6, SCL=GPIO7) which are fixed and not user-configurable.
+  // VL53L0X is on Wire (SDA=GPIO14, SCL=GPIO15) which are fixed and not user-configurable.
 }
 
 void clearConfig() {
@@ -706,7 +706,7 @@ const char CONFIG_HTML[] PROGMEM = R"rawhtml(
         <label>Distance when empty / stop pumps (mm)
           <input type="number" name="waterEmpty" value="190" min="0" max="3000">
         </label>
-        <p class="hint">VL53L0X on Wire1: SDA=GPIO6, SCL=GPIO7. Mount sensor at top of reservoir pointing down. Distances are measured from the sensor face to the water surface.</p>
+        <p class="hint">VL53L0X on Wire: SDA=GPIO14, SCL=GPIO15. Mount sensor at top of reservoir pointing down. Distances are measured from the sensor face to the water surface.</p>
       </div>
     </details>
 
@@ -1137,7 +1137,7 @@ void publishPumpState(int idx) {
 }
 
 // ── VL53L0X water level sensor ────────────────────────────
-// Sensor on Wire1: SDA=GPIO6, SCL=GPIO7 (Wire1 defaults on ESP32-C6-Zero).
+// Sensor on Wire: SDA=GPIO14, SCL=GPIO15 (Wire defaults on ESP32-C6-Zero).
 // Using Pololu VL53L0X library (lightweight — no display deps).
 // waterLevelLow declared above startPump() so the pump guard can reference it.
 VL53L0X lox;
@@ -1317,8 +1317,8 @@ void applyConfigUpdate(const char* json) {
     cfg.waterLevelPin = enabling ? 0 : -1;
     if (enabling && !waterSensorOk) {
       // Sensor not yet initialised — attempt init now (e.g. enabled via HA after boot)
-      Wire1.begin();
-      lox.setBus(&Wire1);
+      Wire.begin();
+      lox.setBus(&Wire);
       lox.setTimeout(500);
       waterSensorOk = lox.init();
       logf("Water     — sensor %s after runtime enable\n",
@@ -1917,10 +1917,10 @@ void setup() {
   buildDerivedConfig();
   initPumpPins();
 
-  // VL53L0X water level sensor — Wire1 (SDA=GPIO6, SCL=GPIO7 on ESP32-C6-Zero)
+  // VL53L0X water level sensor — Wire (SDA=GPIO14, SCL=GPIO15 on ESP32-C6-Zero)
   if (cfg.waterLevelPin >= 0) {
-    Wire1.begin();  // SDA=GPIO6, SCL=GPIO7 (Wire1 defaults on ESP32-C6-Zero)
-    lox.setBus(&Wire1);
+    Wire.begin();  // SDA=GPIO14, SCL=GPIO15 (Wire defaults on ESP32-C6-Zero, top header)
+    lox.setBus(&Wire);
     lox.setTimeout(500);
     waterSensorOk = lox.init();
     if (waterSensorOk) {
@@ -1932,10 +1932,10 @@ void setup() {
         ? constrain(100 * (cfg.waterEmptyMm - dist) / range, 0, 100)
         : 0;
       waterLevelLow = (dist >= cfg.waterEmptyMm);
-      logf("Water     — VL53L0X ready (SDA=GPIO6, SCL=GPIO7), dist=%dmm, level=%d%%, state=%s\n",
+      logf("Water     — VL53L0X ready (SDA=GPIO14, SCL=GPIO15), dist=%dmm, level=%d%%, state=%s\n",
         dist, waterLevelPct, waterLevelLow ? "LOW" : "OK");
     } else {
-      logf("Water     — VL53L0X init FAILED (check wiring: SDA=GPIO6, SCL=GPIO7)\n");
+      logf("Water     — VL53L0X init FAILED (check wiring: SDA=GPIO14, SCL=GPIO15)\n");
       waterLevelLow = true;   // fail safe
     }
   }
