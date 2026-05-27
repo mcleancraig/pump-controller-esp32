@@ -7,12 +7,24 @@
 #include <PubSubClient.h>
 #include <HTTPUpdate.h>
 #include <WiFiClientSecure.h>
+#include <Wire.h>
+#include <VL53L0X.h>   // Pololu library — lightweight, no display deps
 #include <time.h>
 #include "esp_mac.h"
 #include "esp_system.h"
 #include "esp_task_wdt.h"
 
 // ═══════════════════════════════════════════════════════════
+//  v1.3.0
+//  - Replace Hall/reed binary water sensor with VL53L0X ToF distance sensor.
+//    Sensor on Wire (SDA=GPIO14, SCL=GPIO15 — Wire defaults on ESP32-C6-Zero).
+//    Drop-in swap to VL53L1X: change include + class name only.
+//    waterLevelPin repurposed as enable flag (-1=disabled, ≥0=enabled).
+//    waterFullMm / waterEmptyMm configurable via HA, portal, MQTT.
+//    Publishes water_level (LOW/OK) + water_pct (0-100%) to MQTT.
+//    Invalid sensor readings treated as empty (fail-safe).
+//    Raw GPIO debounce replaced with 2-second polling loop.
+//
 //  v1.2.0
 //  - Piezo buzzer support: passive buzzer driven via LEDC PWM
 //    (arduino-esp32 v3 ledcAttach / ledcWriteTone).
@@ -70,7 +82,7 @@
 //  - MQTT callback safety: no publish() inside callback; deferred via flags
 // ═══════════════════════════════════════════════════════════
 
-#define FIRMWARE_VERSION "1.2.1"
+#define FIRMWARE_VERSION "1.3.0"
 
 // ── Hardware constants ────────────────────────────────────
 const int BTN_BOOT          = 9;   // Boot button — GPIO9 on Waveshare C6-Zero / XIAO C6
@@ -90,7 +102,7 @@ const int MQTT_TIMEOUT_S            = 5;
 const unsigned long MQTT_RECONNECT_COOLDOWN_MS = 5000;
 const unsigned long HEARTBEAT_INTERVAL_MS      = 30000;
 const unsigned long FOTA_CHECK_INTERVAL_MS     = 3600000UL;  // 1 hour
-const unsigned long WATER_DEBOUNCE_MS          = 1000;       // Hall / reed switch debounce
+const unsigned long WATER_POLL_MS              = 2000;       // VL53L0X polling interval
 const int NTP_TIMEOUT_MS            = 10000;
 const int FOTA_VERSION_TIMEOUT_MS   = 8000;
 const int FOTA_DL_TIMEOUT_MS        = 60000;
@@ -148,7 +160,9 @@ struct Config {
   int     pumpCount;                    // 1-MAX_PUMPS, default 1
   int     pumpPin[MAX_PUMPS];           // GPIO pin for each pump
   int     pumpDuration[MAX_PUMPS];      // seconds to run on "water" command
-  int     waterLevelPin;                // GPIO for NO reed switch; -1 = disabled
+  int     waterLevelPin;                // water sensor enable flag: -1 = disabled, ≥0 = enabled
+  int     waterFullMm;                  // distance (mm) when tank is full, default 25
+  int     waterEmptyMm;                 // distance (mm) when tank is empty / pumps stop, default 190
   int     piezoPin;                     // GPIO for passive piezo buzzer; -1 = disabled
   char    fwChannel[8];                 // "stable" (default) or "beta"
 } cfg;
@@ -219,8 +233,10 @@ void loadConfig() {
     cfg.pumpPin[i]      = prefs.getInt(keyPin, DEFAULT_PUMP_PINS[i]);
     cfg.pumpDuration[i] = prefs.getInt(keyDur, 5);
   }
-  cfg.waterLevelPin = prefs.getInt("waterPin",  -1);
-  cfg.piezoPin      = prefs.getInt("piezoPin",  PIEZO_PIN_DEFAULT);
+  cfg.waterLevelPin = prefs.getInt("waterPin",   -1);
+  cfg.waterFullMm   = prefs.getInt("waterFull",  25);
+  cfg.waterEmptyMm  = prefs.getInt("waterEmpty", 190);
+  cfg.piezoPin      = prefs.getInt("piezoPin",   PIEZO_PIN_DEFAULT);
   prefs.getString("fwChannel", cfg.fwChannel, sizeof(cfg.fwChannel));
   if (strlen(cfg.fwChannel) == 0) strlcpy(cfg.fwChannel, "stable", sizeof(cfg.fwChannel));
 
@@ -241,19 +257,13 @@ void validateConfig() {
           i + 1, j + 1, cfg.pumpPin[i]);
       }
     }
-    if (cfg.waterLevelPin >= 0 && cfg.pumpPin[i] == cfg.waterLevelPin) {
-      logf("Config    — WARNING: pump %d and water level sensor share GPIO%d\n",
-        i + 1, cfg.waterLevelPin);
-    }
     if (cfg.piezoPin >= 0 && cfg.pumpPin[i] == cfg.piezoPin) {
       logf("Config    — WARNING: pump %d and piezo buzzer share GPIO%d\n",
         i + 1, cfg.piezoPin);
     }
   }
-  if (cfg.piezoPin >= 0 && cfg.waterLevelPin >= 0 && cfg.piezoPin == cfg.waterLevelPin) {
-    logf("Config    — WARNING: piezo buzzer and water level sensor share GPIO%d\n",
-      cfg.piezoPin);
-  }
+  // Note: waterLevelPin is now an enable flag (not a GPIO), so no pin conflict check.
+  // VL53L0X is on Wire (SDA=GPIO14, SCL=GPIO15) which are fixed and not user-configurable.
 }
 
 void clearConfig() {
@@ -289,6 +299,8 @@ void saveConfig(const Config& c) {
     prefs.putInt(keyDur, c.pumpDuration[i]);
   }
   prefs.putInt("waterPin",       c.waterLevelPin);
+  prefs.putInt("waterFull",      c.waterFullMm);
+  prefs.putInt("waterEmpty",     c.waterEmptyMm);
   prefs.putInt("piezoPin",       c.piezoPin);
   prefs.putString("fwChannel",  c.fwChannel);
   prefs.end();
@@ -334,8 +346,11 @@ char DISC_CFG_PUMP_COUNT[128];
 // Water level sensor
 char WATER_LEVEL_TOPIC[64];
 char DISC_WATER_LEVEL[128];
+char DISC_WATER_PCT[128];
 char AVAILABILITY_TOPIC[64]; // garden/pumpN/availability — LWT publishes "offline" here
-char DISC_CFG_WATER_PIN[128];
+char DISC_CFG_WATER_ENABLED[128];
+char DISC_CFG_WATER_FULL[128];
+char DISC_CFG_WATER_EMPTY[128];
 char DISC_CFG_PIEZO_PIN[128];
 char DISC_CFG_FW_CHANNEL[128];
 // Network config discovery topics
@@ -376,15 +391,21 @@ void buildDerivedConfig() {
   snprintf(DISC_CFG_PUMP_COUNT,   sizeof(DISC_CFG_PUMP_COUNT),
     "%s/number/%s_cfg_pump_count/config",  HA_DISCOVERY_PREFIX, UNIT_ID);
 
-  snprintf(WATER_LEVEL_TOPIC,    sizeof(WATER_LEVEL_TOPIC),
-    "garden/%s/water_level",               UNIT_ID);
-  snprintf(DISC_WATER_LEVEL,     sizeof(DISC_WATER_LEVEL),
-    "%s/binary_sensor/%s_water_level/config", HA_DISCOVERY_PREFIX, UNIT_ID);
-  snprintf(AVAILABILITY_TOPIC,   sizeof(AVAILABILITY_TOPIC),
-    "garden/%s/availability",              UNIT_ID);
-  snprintf(DISC_CFG_WATER_PIN,   sizeof(DISC_CFG_WATER_PIN),
-    "%s/number/%s_cfg_water_pin/config",   HA_DISCOVERY_PREFIX, UNIT_ID);
-  snprintf(DISC_CFG_PIEZO_PIN,   sizeof(DISC_CFG_PIEZO_PIN),
+  snprintf(WATER_LEVEL_TOPIC,      sizeof(WATER_LEVEL_TOPIC),
+    "garden/%s/water_level",                   UNIT_ID);
+  snprintf(DISC_WATER_LEVEL,       sizeof(DISC_WATER_LEVEL),
+    "%s/binary_sensor/%s_water_level/config",  HA_DISCOVERY_PREFIX, UNIT_ID);
+  snprintf(DISC_WATER_PCT,         sizeof(DISC_WATER_PCT),
+    "%s/sensor/%s_water_pct/config",           HA_DISCOVERY_PREFIX, UNIT_ID);
+  snprintf(AVAILABILITY_TOPIC,     sizeof(AVAILABILITY_TOPIC),
+    "garden/%s/availability",                  UNIT_ID);
+  snprintf(DISC_CFG_WATER_ENABLED, sizeof(DISC_CFG_WATER_ENABLED),
+    "%s/switch/%s_cfg_water_enabled/config",   HA_DISCOVERY_PREFIX, UNIT_ID);
+  snprintf(DISC_CFG_WATER_FULL,    sizeof(DISC_CFG_WATER_FULL),
+    "%s/number/%s_cfg_water_full/config",      HA_DISCOVERY_PREFIX, UNIT_ID);
+  snprintf(DISC_CFG_WATER_EMPTY,   sizeof(DISC_CFG_WATER_EMPTY),
+    "%s/number/%s_cfg_water_empty/config",     HA_DISCOVERY_PREFIX, UNIT_ID);
+  snprintf(DISC_CFG_PIEZO_PIN,     sizeof(DISC_CFG_PIEZO_PIN),
     "%s/number/%s_cfg_piezo_pin/config",   HA_DISCOVERY_PREFIX, UNIT_ID);
   snprintf(DISC_CFG_FW_CHANNEL,  sizeof(DISC_CFG_FW_CHANNEL),
     "%s/select/%s_cfg_fw_channel/config",  HA_DISCOVERY_PREFIX, UNIT_ID);
@@ -674,10 +695,19 @@ const char CONFIG_HTML[] PROGMEM = R"rawhtml(
   <div class="section">
     <details>
       <summary>Water level sensor <span class="optional">(optional)</span></summary>
-      <label style="margin-top:12px">Reed switch GPIO pin
-        <input type="number" name="waterPin" value="-1" min="-1" max="28">
+      <label style="margin-top:12px;flex-direction:row;align-items:center;gap:8px">
+        <input type="checkbox" name="waterEnabled" id="waterEnabled" onchange="toggleWater(this)">
+        Enable VL53L0X distance sensor
       </label>
-      <p class="hint">Normally-open reed switch with float and magnet. Float drops when tank is low, bringing the magnet to the reed and closing it (GPIO LOW = water low). Reed open (GPIO HIGH) = water OK. Set to -1 to disable.</p>
+      <div id="water-rows" style="display:none">
+        <label style="margin-top:12px">Distance when full (mm)
+          <input type="number" name="waterFull" value="25" min="0" max="3000">
+        </label>
+        <label>Distance when empty / stop pumps (mm)
+          <input type="number" name="waterEmpty" value="190" min="0" max="3000">
+        </label>
+        <p class="hint">VL53L0X on Wire: SDA=GPIO14, SCL=GPIO15. Mount sensor at top of reservoir pointing down. Distances are measured from the sensor face to the water surface.</p>
+      </div>
     </details>
 
     <details>
@@ -703,6 +733,9 @@ function toggleNet(chk) {
 function togglePw(btn) {
   var inp = btn.parentElement.querySelector('input');
   inp.type = inp.type === 'password' ? 'text' : 'password';
+}
+function toggleWater(chk) {
+  document.getElementById('water-rows').style.display = chk.checked ? 'block' : 'none';
 }
 function updatePumpRows() {
   var raw = parseInt(document.getElementById('pumpCount').value) || 1;
@@ -810,8 +843,12 @@ void handleSave() {
     c.pumpDuration[i] = (dur >= 1 && dur <= PUMP_MAX_DURATION_S) ? dur : 5;
   }
 
-  int waterPin = server.hasArg("waterPin") ? server.arg("waterPin").toInt() : -1;
-  c.waterLevelPin = (waterPin >= -1 && waterPin <= 28) ? waterPin : -1;
+  bool waterEnabled = server.hasArg("waterEnabled") && server.arg("waterEnabled") == "on";
+  c.waterLevelPin = waterEnabled ? 0 : -1;
+  int waterFull  = server.hasArg("waterFull")  ? server.arg("waterFull").toInt()  : 25;
+  int waterEmpty = server.hasArg("waterEmpty") ? server.arg("waterEmpty").toInt() : 190;
+  c.waterFullMm  = (waterFull  >= 0 && waterFull  < waterEmpty) ? waterFull  : 25;
+  c.waterEmptyMm = (waterEmpty > waterFull && waterEmpty <= 3000) ? waterEmpty : 190;
 
   int piezoPin = server.hasArg("piezoPin") ? server.arg("piezoPin").toInt() : PIEZO_PIN_DEFAULT;
   c.piezoPin = (piezoPin >= -1 && piezoPin <= 28) ? piezoPin : PIEZO_PIN_DEFAULT;
@@ -824,18 +861,12 @@ void handleSave() {
           "Pump " + String(i+1) + " and pump " + String(j+1) + " share the same GPIO"); return;
       }
     }
-    if (c.waterLevelPin >= 0 && c.pumpPin[i] == c.waterLevelPin) {
-      server.send(400, "text/plain",
-        "Pump " + String(i+1) + " and water level sensor share the same GPIO"); return;
-    }
     if (c.piezoPin >= 0 && c.pumpPin[i] == c.piezoPin) {
       server.send(400, "text/plain",
         "Pump " + String(i+1) + " and piezo buzzer share the same GPIO"); return;
     }
   }
-  if (c.piezoPin >= 0 && c.waterLevelPin >= 0 && c.piezoPin == c.waterLevelPin) {
-    server.send(400, "text/plain", "Piezo buzzer and water level sensor share the same GPIO"); return;
-  }
+  // Note: water sensor is on fixed I2C pins (GPIO6/7) — no GPIO conflict check needed.
 
   saveConfig(c);
   server.send(200, "text/html",
@@ -940,28 +971,28 @@ void buzz(int freq, int ms) {
 void buzzLowWater() {
   // Three slow low-tone beeps: 500ms on, 500ms off
   for (int i = 0; i < 3; i++) {
-    buzz(1100, 500);
+    buzz(1000, 500);
     if (i < 2) delay(500);
   }
 }
 
 void buzzWateringStarted() {
   // Two short high chirps: 100ms on, 100ms off
-  buzz(3550, 100);
+  buzz(4000, 100);
   delay(100);
-  buzz(3550, 100);
+  buzz(4000, 100);
 }
 
 void buzzWateringDone() {
   // One high then one low beep: 150ms each
-  buzz(3550, 150);
+  buzz(4000, 150);
   delay(50);
-  buzz(1100, 150);
+  buzz(1000, 150);
 }
 
 void buzzBoot() {
   // High → mid → low → mid → high: 80ms notes, 30ms gaps
-  const int notes[] = { 3550, 2200, 1100, 2200, 3550 };
+  const int notes[] = { 4000, 3000, 1000, 3000, 4000 };
   for (int i = 0; i < 5; i++) {
     buzz(notes[i], 80);
     if (i < 4) delay(30);
@@ -1062,6 +1093,11 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       bool val = (strcasecmp(msg, "ON") == 0 || strcmp(msg, "true") == 0 || strcmp(msg, "1") == 0);
       snprintf(pendingConfigPayload, sizeof(pendingConfigPayload),
                "{\"staticIP\":%s}", val ? "true" : "false");
+    } else if (strcmp(field, "waterLevelPin") == 0) {
+      // HA switch sends "ON"/"OFF"; convert to enable flag (0 = enabled, -1 = disabled)
+      bool val = (strcasecmp(msg, "ON") == 0 || strcmp(msg, "true") == 0 || strcmp(msg, "1") == 0);
+      snprintf(pendingConfigPayload, sizeof(pendingConfigPayload),
+               "{\"waterLevelPin\":%d}", val ? 0 : -1);
     } else if (isStr) {
       snprintf(pendingConfigPayload, sizeof(pendingConfigPayload),
                "{\"%s\":\"%s\"}", field, msg);
@@ -1100,39 +1136,65 @@ void publishPumpState(int idx) {
   mqtt.publish(topic, state, true);  // retained so HA picks it up on subscribe
 }
 
-// ── Water level sensor state ──────────────────────────────
-// NO reed switch: float drops when tank is low → magnet reaches reed → reed closes → GPIO LOW = water LOW.
-// Float up (water OK) → magnet away from reed → reed open → INPUT_PULLUP holds GPIO HIGH = OK.
+// ── VL53L0X water level sensor ────────────────────────────
+// Sensor on Wire: SDA=GPIO14, SCL=GPIO15 (Wire defaults on ESP32-C6-Zero).
+// Using Pololu VL53L0X library (lightweight — no display deps).
 // waterLevelLow declared above startPump() so the pump guard can reference it.
-static int  waterLevelPinLast = -2;     // last raw read (-2 = uninitialised)
-static unsigned long waterLevelStableMs = 0;
+VL53L0X lox;
+static bool waterSensorOk  = false;
+static int  waterLevelPct  = -1;    // 0-100 %; -1 = unknown (sensor not yet read)
 
 void publishWaterLevel() {
   if (cfg.waterLevelPin < 0) return;
-  char wlPayload[32];
-  snprintf(wlPayload, sizeof(wlPayload), "{\"water_level\":\"%s\"}", waterLevelLow ? "LOW" : "OK");
-  mqtt.publish(WATER_LEVEL_TOPIC, wlPayload, true);
+  char payload[64];
+  snprintf(payload, sizeof(payload),
+    "{\"water_level\":\"%s\",\"water_pct\":%d}",
+    waterLevelLow ? "LOW" : "OK",
+    waterLevelPct >= 0 ? waterLevelPct : 0);
+  mqtt.publish(WATER_LEVEL_TOPIC, payload, true);
 }
 
 void updateWaterLevel() {
-  if (cfg.waterLevelPin < 0) return;
-  int raw = digitalRead(cfg.waterLevelPin);   // LOW = reed closed = water low
-  if (raw != waterLevelPinLast) {
-    waterLevelPinLast = raw;
-    waterLevelStableMs = millis();
-    return;  // restart debounce timer
+  if (cfg.waterLevelPin < 0 || !waterSensorOk) return;
+
+  static unsigned long lastPoll = 0;
+  if (millis() - lastPoll < WATER_POLL_MS) return;
+  lastPoll = millis();
+
+  // Take 3 readings and average valid ones
+  int sum = 0, count = 0;
+  for (int i = 0; i < 3; i++) {
+    int d = lox.readRangeSingleMillimeters();
+    if (!lox.timeoutOccurred()) { sum += d; count++; }
+    if (i < 2) delay(35);
   }
-  if (millis() - waterLevelStableMs < WATER_DEBOUNCE_MS) return;  // still settling
-  bool nowLow = (raw == LOW);
-  if (nowLow == waterLevelLow) return;  // no change
-  waterLevelLow = nowLow;
-  if (waterLevelLow) {
-    logf("Water     — LOW (reed closed, GPIO%d LOW)\n", cfg.waterLevelPin);
-    for (int i = 0; i < cfg.pumpCount; i++) stopPump(i, false);
-    buzzLowWater();
+
+  bool nowLow;
+  if (count == 0) {
+    // No valid reading — fail safe: treat as empty
+    logf("Water     — sensor read failed, treating as empty\n");
+    waterLevelPct = 0;
+    nowLow = true;
   } else {
-    logf("Water     — OK (reed open, GPIO%d HIGH)\n", cfg.waterLevelPin);
+    int dist  = sum / count;
+    int range = cfg.waterEmptyMm - cfg.waterFullMm;
+    waterLevelPct = (range > 0)
+      ? constrain(100 * (cfg.waterEmptyMm - dist) / range, 0, 100)
+      : 0;
+    nowLow = (dist >= cfg.waterEmptyMm);
   }
+
+  if (nowLow != waterLevelLow) {
+    waterLevelLow = nowLow;
+    if (waterLevelLow) {
+      logf("Water     — LOW (%d%%)\n", waterLevelPct);
+      for (int i = 0; i < cfg.pumpCount; i++) stopPump(i, false);
+      buzzLowWater();
+    } else {
+      logf("Water     — OK (%d%%)\n", waterLevelPct);
+    }
+  }
+
   if (mqtt.connected()) publishWaterLevel();
 }
 
@@ -1169,12 +1231,15 @@ void publishConfigState() {
     "\"syslogHost\":\"%s\",\"syslogPort\":%d,"
     "\"pumpCount\":%d,\"pumpPins\":%s,\"pumpDurations\":%s,"
     "\"staticIP\":%s,\"ip\":\"%s\",\"gw\":\"%s\",\"sn\":\"%s\",\"dns\":\"%s\","
-    "\"waterLevelPin\":%d,\"piezoPin\":%d,\"fwChannel\":\"%s\"}",
+    "\"waterLevelPin\":%d,\"waterFullMm\":%d,\"waterEmptyMm\":%d,"
+    "\"waterLevelPct\":%d,\"piezoPin\":%d,\"fwChannel\":\"%s\"}",
     cfg.mqttBroker, cfg.mqttPort, cfg.mqttUser,
     cfg.syslogHost, cfg.syslogPort,
     cfg.pumpCount, pins, durs,
     cfg.staticIP ? "true" : "false", ipStr, gwStr, snStr, dnsStr,
-    cfg.waterLevelPin, cfg.piezoPin, cfg.fwChannel);
+    cfg.waterLevelPin, cfg.waterFullMm, cfg.waterEmptyMm,
+    waterLevelPct >= 0 ? waterLevelPct : 0,
+    cfg.piezoPin, cfg.fwChannel);
   mqtt.publish(CONFIG_STATE_TOPIC, payload, true);
 }
 
@@ -1246,14 +1311,25 @@ void applyConfigUpdate(const char* json) {
       logf("Config    — fwChannel rejected: must be 'stable' or 'beta'\n");
     }
   }
-  if (extractInt(json, "waterLevelPin", &ival) && ival >= -1 && ival <= 28) {
-    bool conflict = false;
-    // Only check against active pump slots — inactive slots hold stale defaults
-    for (int i = 0; i < cfg.pumpCount && !conflict; i++)
-      if (ival >= 0 && cfg.pumpPin[i] == ival) conflict = true;
-    if (!conflict && !(ival >= 0 && ival == cfg.piezoPin)) cfg.waterLevelPin = ival;
-    else logf("Config    — waterLevelPin %d rejected (conflicts with existing pin)\n", ival);
+  if (extractInt(json, "waterLevelPin", &ival)) {
+    // Treat as enable flag: any value >= 0 enables, -1 disables
+    bool enabling = (ival >= 0);
+    cfg.waterLevelPin = enabling ? 0 : -1;
+    if (enabling && !waterSensorOk) {
+      // Sensor not yet initialised — attempt init now (e.g. enabled via HA after boot)
+      Wire.begin();
+      lox.setBus(&Wire);
+      lox.setTimeout(500);
+      waterSensorOk = lox.init();
+      logf("Water     — sensor %s after runtime enable\n",
+           waterSensorOk ? "initialised" : "init FAILED (check wiring)");
+    }
+    logf("Config    — water sensor %s\n", enabling ? "enabled" : "disabled");
   }
+  if (extractInt(json, "waterFullMm", &ival) && ival >= 0 && ival < cfg.waterEmptyMm)
+    cfg.waterFullMm = ival;
+  if (extractInt(json, "waterEmptyMm", &ival) && ival > cfg.waterFullMm && ival <= 3000)
+    cfg.waterEmptyMm = ival;
   if (extractInt(json, "piezoPin", &ival) && ival >= -1 && ival <= 28) {
     bool conflict = false;
     for (int i = 0; i < cfg.pumpCount && !conflict; i++)
@@ -1275,7 +1351,7 @@ void applyConfigUpdate(const char* json) {
     snprintf(keyPin, sizeof(keyPin), "pumpPin%d", i);
     snprintf(keyDur, sizeof(keyDur), "pumpDuration%d", i);
     if (extractInt(json, keyPin, &ival) && ival >= 0 && ival <= 28) {
-      bool conflict = (ival == cfg.waterLevelPin);
+      bool conflict = (cfg.piezoPin >= 0 && ival == cfg.piezoPin);
       // Only check against active pump slots — inactive slots hold stale defaults
       for (int j = 0; j < cfg.pumpCount && !conflict; j++)
         if (j != i && cfg.pumpPin[j] == ival) conflict = true;
@@ -1452,7 +1528,7 @@ void publishHADiscovery() {
     mqtt.publish(discDur, payload, true);
   }
 
-  // ── Water level sensor ────────────────────────────────────
+  // ── Water level sensor — binary alert ─────────────────────
   if (cfg.waterLevelPin >= 0) {
     snprintf(payload, sizeof(payload),
       "{\"name\":\"Water Level\",\"unique_id\":\"%s_water_level\","
@@ -1467,14 +1543,53 @@ void publishHADiscovery() {
   }
   mqtt.publish(DISC_WATER_LEVEL, payload, true);
 
+  // ── Water level sensor — percentage gauge ─────────────────
+  if (cfg.waterLevelPin >= 0) {
+    snprintf(payload, sizeof(payload),
+      "{\"name\":\"Water Level %%\",\"unique_id\":\"%s_water_pct\","
+      "\"state_topic\":\"%s\","
+      "\"value_template\":\"{{value_json.water_pct}}\","
+      "\"unit_of_measurement\":\"%%\","
+      "\"state_class\":\"measurement\","
+      "\"icon\":\"mdi:water-percent\",%s}",
+      UNIT_ID, WATER_LEVEL_TOPIC, dev);
+  } else {
+    payload[0] = '\0';
+  }
+  mqtt.publish(DISC_WATER_PCT, payload, true);
+
+  // ── Config: water sensor enabled switch ───────────────────
   snprintf(cmdTopic, sizeof(cmdTopic), "%s/waterLevelPin", CONFIG_SET_PREFIX);
   snprintf(payload, sizeof(payload),
-    "{\"name\":\"Water Level Pin\",\"unique_id\":\"%s_cfg_water_pin\","
-    "\"state_topic\":\"%s\",\"value_template\":\"{{value_json.waterLevelPin}}\","
-    "\"command_topic\":\"%s\",\"min\":-1,\"max\":28,\"mode\":\"box\","
-    "\"icon\":\"mdi:electric-switch\",\"entity_category\":\"config\",%s}",
+    "{\"name\":\"Water Sensor\",\"unique_id\":\"%s_cfg_water_enabled\","
+    "\"state_topic\":\"%s\","
+    "\"value_template\":\"{%% if value_json.waterLevelPin >= 0 %%}ON{%% else %%}OFF{%% endif %%}\","
+    "\"command_topic\":\"%s\","
+    "\"payload_on\":\"ON\",\"payload_off\":\"OFF\","
+    "\"icon\":\"mdi:ruler\",\"entity_category\":\"config\",%s}",
     UNIT_ID, CONFIG_STATE_TOPIC, cmdTopic, dev);
-  mqtt.publish(DISC_CFG_WATER_PIN, payload, true);
+  mqtt.publish(DISC_CFG_WATER_ENABLED, payload, true);
+
+  // ── Config: full and empty distances ─────────────────────
+  snprintf(cmdTopic, sizeof(cmdTopic), "%s/waterFullMm", CONFIG_SET_PREFIX);
+  snprintf(payload, sizeof(payload),
+    "{\"name\":\"Water Full Distance (mm)\",\"unique_id\":\"%s_cfg_water_full\","
+    "\"state_topic\":\"%s\",\"value_template\":\"{{value_json.waterFullMm}}\","
+    "\"command_topic\":\"%s\",\"min\":0,\"max\":3000,\"mode\":\"box\","
+    "\"unit_of_measurement\":\"mm\","
+    "\"icon\":\"mdi:arrow-collapse-down\",\"entity_category\":\"config\",%s}",
+    UNIT_ID, CONFIG_STATE_TOPIC, cmdTopic, dev);
+  mqtt.publish(DISC_CFG_WATER_FULL, payload, true);
+
+  snprintf(cmdTopic, sizeof(cmdTopic), "%s/waterEmptyMm", CONFIG_SET_PREFIX);
+  snprintf(payload, sizeof(payload),
+    "{\"name\":\"Water Empty Distance (mm)\",\"unique_id\":\"%s_cfg_water_empty\","
+    "\"state_topic\":\"%s\",\"value_template\":\"{{value_json.waterEmptyMm}}\","
+    "\"command_topic\":\"%s\",\"min\":0,\"max\":3000,\"mode\":\"box\","
+    "\"unit_of_measurement\":\"mm\","
+    "\"icon\":\"mdi:arrow-expand-down\",\"entity_category\":\"config\",%s}",
+    UNIT_ID, CONFIG_STATE_TOPIC, cmdTopic, dev);
+  mqtt.publish(DISC_CFG_WATER_EMPTY, payload, true);
 
   snprintf(cmdTopic, sizeof(cmdTopic), "%s/piezoPin", CONFIG_SET_PREFIX);
   snprintf(payload, sizeof(payload),
@@ -1802,15 +1917,27 @@ void setup() {
   buildDerivedConfig();
   initPumpPins();
 
-  // Water level reed switch — INPUT_PULLUP; take an initial reading so
-  // the debounce state is seeded and the first publish reflects reality.
+  // VL53L0X water level sensor — Wire (SDA=GPIO14, SCL=GPIO15 on ESP32-C6-Zero)
   if (cfg.waterLevelPin >= 0) {
-    pinMode(cfg.waterLevelPin, INPUT_PULLUP);
-    waterLevelPinLast = digitalRead(cfg.waterLevelPin);
-    waterLevelStableMs = millis();
-    waterLevelLow = (waterLevelPinLast == LOW);
-    logf("Water     — pin GPIO%d, initial state: %s\n",
-      cfg.waterLevelPin, waterLevelLow ? "LOW" : "OK");
+    Wire.begin();  // SDA=GPIO14, SCL=GPIO15 (Wire defaults on ESP32-C6-Zero, top header)
+    lox.setBus(&Wire);
+    lox.setTimeout(500);
+    waterSensorOk = lox.init();
+    if (waterSensorOk) {
+      // Take an initial reading to seed waterLevelLow before loop() starts
+      int dist = lox.readRangeSingleMillimeters();
+      if (lox.timeoutOccurred()) dist = cfg.waterEmptyMm;  // fail safe
+      int range = cfg.waterEmptyMm - cfg.waterFullMm;
+      waterLevelPct = (range > 0)
+        ? constrain(100 * (cfg.waterEmptyMm - dist) / range, 0, 100)
+        : 0;
+      waterLevelLow = (dist >= cfg.waterEmptyMm);
+      logf("Water     — VL53L0X ready (SDA=GPIO14, SCL=GPIO15), dist=%dmm, level=%d%%, state=%s\n",
+        dist, waterLevelPct, waterLevelLow ? "LOW" : "OK");
+    } else {
+      logf("Water     — VL53L0X init FAILED (check wiring: SDA=GPIO14, SCL=GPIO15)\n");
+      waterLevelLow = true;   // fail safe
+    }
   }
 
   // Piezo buzzer — attach LEDC channel to pin for PWM tone generation.
@@ -1950,11 +2077,10 @@ void loop() {
       stopPump(i);
       logf("Pump %d   — stopped (duration elapsed)\n", i + 1);
       if (mqtt.connected()) publishPumpState(i);
-    } else if (cfg.waterLevelPin >= 0 && digitalRead(cfg.waterLevelPin) == LOW) {
-      // Raw pin check — no debounce — so a running pump is cut immediately
-      // when the reed closes, regardless of where the debounced state machine is.
+    } else if (waterLevelLow) {
+      // Cached state updated by updateWaterLevel() every WATER_POLL_MS
       stopPump(i, false);  // buzz handled by updateWaterLevel() / buzzLowWater()
-      logf("Pump %d   — stopped (water LOW, raw pin)\n", i + 1);
+      logf("Pump %d   — stopped (water LOW)\n", i + 1);
       if (mqtt.connected()) publishPumpState(i);
     }
   }
