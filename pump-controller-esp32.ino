@@ -971,28 +971,28 @@ void buzz(int freq, int ms) {
 void buzzLowWater() {
   // Three slow low-tone beeps: 500ms on, 500ms off
   for (int i = 0; i < 3; i++) {
-    buzz(1100, 500);
+    buzz(1000, 500);
     if (i < 2) delay(500);
   }
 }
 
 void buzzWateringStarted() {
   // Two short high chirps: 100ms on, 100ms off
-  buzz(3550, 100);
+  buzz(4000, 100);
   delay(100);
-  buzz(3550, 100);
+  buzz(4000, 100);
 }
 
 void buzzWateringDone() {
   // One high then one low beep: 150ms each
-  buzz(3550, 150);
+  buzz(4000, 150);
   delay(50);
-  buzz(1100, 150);
+  buzz(1000, 150);
 }
 
 void buzzBoot() {
   // High → mid → low → mid → high: 80ms notes, 30ms gaps
-  const int notes[] = { 3550, 2200, 1100, 2200, 3550 };
+  const int notes[] = { 4000, 3000, 1000, 3000, 4000 };
   for (int i = 0; i < 5; i++) {
     buzz(notes[i], 80);
     if (i < 4) delay(30);
