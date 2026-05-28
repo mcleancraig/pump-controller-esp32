@@ -26,3 +26,9 @@
 
 - [ ] **FOTA downgrade protection** — parse semver and only flash if remote >
   local; downgrade opt-in only.
+
+## v2.0 hardware
+
+- [ ] **Per-outlet NeoPixel ring lights** — WS2812B ring around each pump outlet,
+  animated (rolling blue) when that pump is active. One data line per ring (or
+  chained with offsets). Note: adds meaningful BOM cost per unit.
