@@ -32,3 +32,6 @@
 - [ ] **Per-outlet NeoPixel ring lights** — WS2812B ring around each pump outlet,
   animated (rolling blue) when that pump is active. One data line per ring (or
   chained with offsets). Note: adds meaningful BOM cost per unit.
+  - Reference: [Adafruit #2853 — 12x RGBW NeoPixel Ring](https://www.adafruit.com/product/2853) ($9.50, 36.8mm OD / 23.3mm ID)
+  - Cheaper: [Adafruit #1643 — 12x RGB NeoPixel Ring](https://www.adafruit.com/product/1643) ($8.95, same dims, RGB not RGBW — simpler library)
+  - AliExpress clones available ~$1–2/unit; search "WS2812B 12 LED ring"
