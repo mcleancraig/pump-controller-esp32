@@ -2098,6 +2098,15 @@ void setup() {
   logf("Syslog    — flushing\n");
   syslogFlush();
 
+  // Re-log water sensor status now that syslog is ready (boot messages are discarded)
+  if (cfg.waterLevelPin >= 0) {
+    if (waterSensorOk)
+      logf("Water     — sensor OK (SDA=GPIO14, SCL=GPIO15), dist=%.0fmm, level=%d%%, state=%s\n",
+           smoothedDistMm, waterLevelPct, waterLevelLow ? "LOW" : "OK");
+    else
+      logf("Water     — sensor FAILED (check wiring: SDA=GPIO14, SCL=GPIO15)\n");
+  }
+
   // FOTA check (once per boot)
   checkForUpdate();
   logf("Heap      — free: %u bytes (min: %u)\n", ESP.getFreeHeap(), ESP.getMinFreeHeap());
