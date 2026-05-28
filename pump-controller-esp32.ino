@@ -15,6 +15,14 @@
 #include "esp_task_wdt.h"
 
 // ═══════════════════════════════════════════════════════════
+//  v1.4.0
+//  - EMA smoothing on VL53L0X readings (alpha=0.2) to reduce surface noise.
+//  - Low-water hysteresis: pumps lock at <waterLockPct% (default 10%),
+//    unlock at >waterUnlockPct% (default 25%). Both configurable via HA/MQTT.
+//  - Calibration buttons in HA: "Set as Full" / "Set as Empty" save the
+//    current smoothed distance as waterFullMm / waterEmptyMm.
+//  - dist_mm added to water level MQTT payload for live monitoring.
+//
 //  v1.3.0
 //  - Replace Hall/reed binary water sensor with VL53L0X ToF distance sensor.
 //    Sensor on Wire (SDA=GPIO14, SCL=GPIO15 — Wire defaults on ESP32-C6-Zero).
@@ -82,7 +90,7 @@
 //  - MQTT callback safety: no publish() inside callback; deferred via flags
 // ═══════════════════════════════════════════════════════════
 
-#define FIRMWARE_VERSION "1.3.0"
+#define FIRMWARE_VERSION "1.4.0"
 
 // ── Hardware constants ────────────────────────────────────
 const int BTN_BOOT          = 9;   // Boot button — GPIO9 on Waveshare C6-Zero / XIAO C6
@@ -162,7 +170,9 @@ struct Config {
   int     pumpDuration[MAX_PUMPS];      // seconds to run on "water" command
   int     waterLevelPin;                // water sensor enable flag: -1 = disabled, ≥0 = enabled
   int     waterFullMm;                  // distance (mm) when tank is full, default 25
-  int     waterEmptyMm;                 // distance (mm) when tank is empty / pumps stop, default 190
+  int     waterEmptyMm;                 // distance (mm) when tank is empty (maps to 0%), default 190
+  int     waterLockPct;                 // % below which pumps lock, default 10
+  int     waterUnlockPct;               // % above which pumps unlock, default 25
   int     piezoPin;                     // GPIO for passive piezo buzzer; -1 = disabled
   char    fwChannel[8];                 // "stable" (default) or "beta"
 } cfg;
@@ -233,9 +243,11 @@ void loadConfig() {
     cfg.pumpPin[i]      = prefs.getInt(keyPin, DEFAULT_PUMP_PINS[i]);
     cfg.pumpDuration[i] = prefs.getInt(keyDur, 5);
   }
-  cfg.waterLevelPin = prefs.getInt("waterPin",   -1);
-  cfg.waterFullMm   = prefs.getInt("waterFull",  25);
-  cfg.waterEmptyMm  = prefs.getInt("waterEmpty", 190);
+  cfg.waterLevelPin  = prefs.getInt("waterPin",    -1);
+  cfg.waterFullMm    = prefs.getInt("waterFull",   25);
+  cfg.waterEmptyMm   = prefs.getInt("waterEmpty",  190);
+  cfg.waterLockPct   = prefs.getInt("waterLock",   10);
+  cfg.waterUnlockPct = prefs.getInt("waterUnlock", 25);
   cfg.piezoPin      = prefs.getInt("piezoPin",   PIEZO_PIN_DEFAULT);
   prefs.getString("fwChannel", cfg.fwChannel, sizeof(cfg.fwChannel));
   if (strlen(cfg.fwChannel) == 0) strlcpy(cfg.fwChannel, "stable", sizeof(cfg.fwChannel));
@@ -301,6 +313,8 @@ void saveConfig(const Config& c) {
   prefs.putInt("waterPin",       c.waterLevelPin);
   prefs.putInt("waterFull",      c.waterFullMm);
   prefs.putInt("waterEmpty",     c.waterEmptyMm);
+  prefs.putInt("waterLock",      c.waterLockPct);
+  prefs.putInt("waterUnlock",    c.waterUnlockPct);
   prefs.putInt("piezoPin",       c.piezoPin);
   prefs.putString("fwChannel",  c.fwChannel);
   prefs.end();
@@ -351,6 +365,10 @@ char AVAILABILITY_TOPIC[64]; // garden/pumpN/availability — LWT publishes "off
 char DISC_CFG_WATER_ENABLED[128];
 char DISC_CFG_WATER_FULL[128];
 char DISC_CFG_WATER_EMPTY[128];
+char DISC_CFG_WATER_LOCK[128];
+char DISC_CFG_WATER_UNLOCK[128];
+char DISC_BTN_CAL_FULL[128];
+char DISC_BTN_CAL_EMPTY[128];
 char DISC_CFG_PIEZO_PIN[128];
 char DISC_CFG_FW_CHANNEL[128];
 // Network config discovery topics
@@ -405,6 +423,14 @@ void buildDerivedConfig() {
     "%s/number/%s_cfg_water_full/config",      HA_DISCOVERY_PREFIX, UNIT_ID);
   snprintf(DISC_CFG_WATER_EMPTY,   sizeof(DISC_CFG_WATER_EMPTY),
     "%s/number/%s_cfg_water_empty/config",     HA_DISCOVERY_PREFIX, UNIT_ID);
+  snprintf(DISC_CFG_WATER_LOCK,    sizeof(DISC_CFG_WATER_LOCK),
+    "%s/number/%s_cfg_water_lock/config",      HA_DISCOVERY_PREFIX, UNIT_ID);
+  snprintf(DISC_CFG_WATER_UNLOCK,  sizeof(DISC_CFG_WATER_UNLOCK),
+    "%s/number/%s_cfg_water_unlock/config",    HA_DISCOVERY_PREFIX, UNIT_ID);
+  snprintf(DISC_BTN_CAL_FULL,      sizeof(DISC_BTN_CAL_FULL),
+    "%s/button/%s_cal_full/config",            HA_DISCOVERY_PREFIX, UNIT_ID);
+  snprintf(DISC_BTN_CAL_EMPTY,     sizeof(DISC_BTN_CAL_EMPTY),
+    "%s/button/%s_cal_empty/config",           HA_DISCOVERY_PREFIX, UNIT_ID);
   snprintf(DISC_CFG_PIEZO_PIN,     sizeof(DISC_CFG_PIEZO_PIN),
     "%s/number/%s_cfg_piezo_pin/config",   HA_DISCOVERY_PREFIX, UNIT_ID);
   snprintf(DISC_CFG_FW_CHANNEL,  sizeof(DISC_CFG_FW_CHANNEL),
@@ -703,10 +729,16 @@ const char CONFIG_HTML[] PROGMEM = R"rawhtml(
         <label style="margin-top:12px">Distance when full (mm)
           <input type="number" name="waterFull" value="25" min="0" max="3000">
         </label>
-        <label>Distance when empty / stop pumps (mm)
+        <label>Distance when empty (mm)
           <input type="number" name="waterEmpty" value="190" min="0" max="3000">
         </label>
-        <p class="hint">VL53L0X on Wire: SDA=GPIO14, SCL=GPIO15. Mount sensor at top of reservoir pointing down. Distances are measured from the sensor face to the water surface.</p>
+        <label>Lock pumps below (%)
+          <input type="number" name="waterLockPct" value="10" min="0" max="100">
+        </label>
+        <label>Unlock pumps above (%)
+          <input type="number" name="waterUnlockPct" value="25" min="0" max="100">
+        </label>
+        <p class="hint">VL53L0X on Wire: SDA=GPIO14, SCL=GPIO15. Mount sensor at top of reservoir pointing down. Use Set Water Full / Set Water Empty buttons in HA to calibrate once installed.</p>
       </div>
     </details>
 
@@ -845,10 +877,14 @@ void handleSave() {
 
   bool waterEnabled = server.hasArg("waterEnabled") && server.arg("waterEnabled") == "on";
   c.waterLevelPin = waterEnabled ? 0 : -1;
-  int waterFull  = server.hasArg("waterFull")  ? server.arg("waterFull").toInt()  : 25;
-  int waterEmpty = server.hasArg("waterEmpty") ? server.arg("waterEmpty").toInt() : 190;
-  c.waterFullMm  = (waterFull  >= 0 && waterFull  < waterEmpty) ? waterFull  : 25;
-  c.waterEmptyMm = (waterEmpty > waterFull && waterEmpty <= 3000) ? waterEmpty : 190;
+  int waterFull   = server.hasArg("waterFull")      ? server.arg("waterFull").toInt()      : 25;
+  int waterEmpty  = server.hasArg("waterEmpty")     ? server.arg("waterEmpty").toInt()     : 190;
+  int waterLock   = server.hasArg("waterLockPct")   ? server.arg("waterLockPct").toInt()   : 10;
+  int waterUnlock = server.hasArg("waterUnlockPct") ? server.arg("waterUnlockPct").toInt() : 25;
+  c.waterFullMm    = (waterFull  >= 0 && waterFull  < waterEmpty)      ? waterFull   : 25;
+  c.waterEmptyMm   = (waterEmpty > waterFull && waterEmpty <= 3000)    ? waterEmpty  : 190;
+  c.waterLockPct   = (waterLock  >= 0 && waterLock  < waterUnlock)     ? waterLock   : 10;
+  c.waterUnlockPct = (waterUnlock > waterLock && waterUnlock <= 100)   ? waterUnlock : 25;
 
   int piezoPin = server.hasArg("piezoPin") ? server.arg("piezoPin").toInt() : PIEZO_PIN_DEFAULT;
   c.piezoPin = (piezoPin >= -1 && piezoPin <= 28) ? piezoPin : PIEZO_PIN_DEFAULT;
@@ -1051,8 +1087,10 @@ struct PendingPumpCmd {
   bool water;  // true=water, false=stop
 };
 static PendingPumpCmd pendingPumpCmd = { false, 0, false };
-static bool pendingRestart = false;
-static bool pendingReset   = false;
+static bool pendingRestart       = false;
+static bool pendingReset         = false;
+static bool pendingWaterCalFull  = false;
+static bool pendingWaterCalEmpty = false;
 
 // Config update payload (JSON) from MQTT
 static char  pendingConfigPayload[256];
@@ -1067,8 +1105,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
   // Unit-level command: garden/pumpN/cmd
   if (strcmp(topic, CMD_TOPIC) == 0) {
-    if (strcmp(msg, "restart") == 0) pendingRestart = true;
-    if (strcmp(msg, "reset")   == 0) pendingReset   = true;
+    if (strcmp(msg, "restart")     == 0) pendingRestart = true;
+    if (strcmp(msg, "reset")       == 0) pendingReset   = true;
+    if (strcmp(msg, "waterCalFull")  == 0) pendingWaterCalFull  = true;
+    if (strcmp(msg, "waterCalEmpty") == 0) pendingWaterCalEmpty = true;
     return;
   }
 
@@ -1144,13 +1184,17 @@ VL53L0X lox;
 static bool waterSensorOk  = false;
 static int  waterLevelPct  = -1;    // 0-100 %; -1 = unknown (sensor not yet read)
 
+// smoothedDistMm declared in updateWaterLevel(); exposed here for publishWaterLevel()
+static float smoothedDistMm = -1.0f;
+
 void publishWaterLevel() {
   if (cfg.waterLevelPin < 0) return;
-  char payload[64];
+  char payload[80];
   snprintf(payload, sizeof(payload),
-    "{\"water_level\":\"%s\",\"water_pct\":%d}",
+    "{\"water_level\":\"%s\",\"water_pct\":%d,\"dist_mm\":%d}",
     waterLevelLow ? "LOW" : "OK",
-    waterLevelPct >= 0 ? waterLevelPct : 0);
+    waterLevelPct >= 0 ? waterLevelPct : 0,
+    smoothedDistMm >= 0 ? (int)smoothedDistMm : -1);
   mqtt.publish(WATER_LEVEL_TOPIC, payload, true);
 }
 
@@ -1173,25 +1217,40 @@ void updateWaterLevel() {
   if (count == 0) {
     // No valid reading — fail safe: treat as empty
     logf("Water     — sensor read failed, treating as empty\n");
-    waterLevelPct = 0;
+    smoothedDistMm = (float)cfg.waterEmptyMm;
+    waterLevelPct  = 0;
     nowLow = true;
   } else {
-    int dist  = sum / count;
+    float raw = (float)(sum / count);
+    // EMA smoothing: alpha=0.2 weights new reading lightly — reduces surface noise
+    // while still tracking real level changes on the 2-second poll interval.
+    if (smoothedDistMm < 0.0f) smoothedDistMm = raw;  // seed on first reading
+    smoothedDistMm = 0.2f * raw + 0.8f * smoothedDistMm;
+
     int range = cfg.waterEmptyMm - cfg.waterFullMm;
     waterLevelPct = (range > 0)
-      ? constrain(100 * (cfg.waterEmptyMm - dist) / range, 0, 100)
+      ? constrain(100 * (cfg.waterEmptyMm - (int)smoothedDistMm) / range, 0, 100)
       : 0;
-    nowLow = (dist >= cfg.waterEmptyMm);
+
+    // Hysteresis: lock pumps below lockPct, unlock above unlockPct
+    if (!waterLevelLow && waterLevelPct < cfg.waterLockPct)
+      nowLow = true;
+    else if (waterLevelLow && waterLevelPct > cfg.waterUnlockPct)
+      nowLow = false;
+    else
+      nowLow = waterLevelLow;  // maintain current state
   }
 
   if (nowLow != waterLevelLow) {
     waterLevelLow = nowLow;
     if (waterLevelLow) {
-      logf("Water     — LOW (%d%%)\n", waterLevelPct);
+      logf("Water     — LOW (%d%%, dist=%.0fmm, lock<%d%%)\n",
+           waterLevelPct, smoothedDistMm, cfg.waterLockPct);
       for (int i = 0; i < cfg.pumpCount; i++) stopPump(i, false);
       buzzLowWater();
     } else {
-      logf("Water     — OK (%d%%)\n", waterLevelPct);
+      logf("Water     — OK (%d%%, dist=%.0fmm, unlock>%d%%)\n",
+           waterLevelPct, smoothedDistMm, cfg.waterUnlockPct);
     }
   }
 
@@ -1232,12 +1291,14 @@ void publishConfigState() {
     "\"pumpCount\":%d,\"pumpPins\":%s,\"pumpDurations\":%s,"
     "\"staticIP\":%s,\"ip\":\"%s\",\"gw\":\"%s\",\"sn\":\"%s\",\"dns\":\"%s\","
     "\"waterLevelPin\":%d,\"waterFullMm\":%d,\"waterEmptyMm\":%d,"
+    "\"waterLockPct\":%d,\"waterUnlockPct\":%d,"
     "\"waterLevelPct\":%d,\"piezoPin\":%d,\"fwChannel\":\"%s\"}",
     cfg.mqttBroker, cfg.mqttPort, cfg.mqttUser,
     cfg.syslogHost, cfg.syslogPort,
     cfg.pumpCount, pins, durs,
     cfg.staticIP ? "true" : "false", ipStr, gwStr, snStr, dnsStr,
     cfg.waterLevelPin, cfg.waterFullMm, cfg.waterEmptyMm,
+    cfg.waterLockPct, cfg.waterUnlockPct,
     waterLevelPct >= 0 ? waterLevelPct : 0,
     cfg.piezoPin, cfg.fwChannel);
   mqtt.publish(CONFIG_STATE_TOPIC, payload, true);
@@ -1330,6 +1391,10 @@ void applyConfigUpdate(const char* json) {
     cfg.waterFullMm = ival;
   if (extractInt(json, "waterEmptyMm", &ival) && ival > cfg.waterFullMm && ival <= 3000)
     cfg.waterEmptyMm = ival;
+  if (extractInt(json, "waterLockPct", &ival) && ival >= 0 && ival < cfg.waterUnlockPct)
+    cfg.waterLockPct = ival;
+  if (extractInt(json, "waterUnlockPct", &ival) && ival > cfg.waterLockPct && ival <= 100)
+    cfg.waterUnlockPct = ival;
   if (extractInt(json, "piezoPin", &ival) && ival >= -1 && ival <= 28) {
     bool conflict = false;
     for (int i = 0; i < cfg.pumpCount && !conflict; i++)
@@ -1590,6 +1655,41 @@ void publishHADiscovery() {
     "\"icon\":\"mdi:arrow-expand-down\",\"entity_category\":\"config\",%s}",
     UNIT_ID, CONFIG_STATE_TOPIC, cmdTopic, dev);
   mqtt.publish(DISC_CFG_WATER_EMPTY, payload, true);
+
+  snprintf(cmdTopic, sizeof(cmdTopic), "%s/waterLockPct", CONFIG_SET_PREFIX);
+  snprintf(payload, sizeof(payload),
+    "{\"name\":\"Water Lock Threshold (%%)\",\"unique_id\":\"%s_cfg_water_lock\","
+    "\"state_topic\":\"%s\",\"value_template\":\"{{value_json.waterLockPct}}\","
+    "\"command_topic\":\"%s\",\"min\":0,\"max\":100,\"mode\":\"box\","
+    "\"unit_of_measurement\":\"%%\","
+    "\"icon\":\"mdi:lock\",\"entity_category\":\"config\",%s}",
+    UNIT_ID, CONFIG_STATE_TOPIC, cmdTopic, dev);
+  mqtt.publish(DISC_CFG_WATER_LOCK, payload, true);
+
+  snprintf(cmdTopic, sizeof(cmdTopic), "%s/waterUnlockPct", CONFIG_SET_PREFIX);
+  snprintf(payload, sizeof(payload),
+    "{\"name\":\"Water Unlock Threshold (%%)\",\"unique_id\":\"%s_cfg_water_unlock\","
+    "\"state_topic\":\"%s\",\"value_template\":\"{{value_json.waterUnlockPct}}\","
+    "\"command_topic\":\"%s\",\"min\":0,\"max\":100,\"mode\":\"box\","
+    "\"unit_of_measurement\":\"%%\","
+    "\"icon\":\"mdi:lock-open\",\"entity_category\":\"config\",%s}",
+    UNIT_ID, CONFIG_STATE_TOPIC, cmdTopic, dev);
+  mqtt.publish(DISC_CFG_WATER_UNLOCK, payload, true);
+
+  // ── Calibration buttons ───────────────────────────────────
+  snprintf(payload, sizeof(payload),
+    "{\"name\":\"Set Water Full\",\"unique_id\":\"%s_cal_full\","
+    "\"command_topic\":\"%s\",\"payload_press\":\"waterCalFull\","
+    "\"icon\":\"mdi:cup-water\",\"entity_category\":\"config\",%s}",
+    UNIT_ID, CMD_TOPIC, dev);
+  mqtt.publish(DISC_BTN_CAL_FULL, payload, true);
+
+  snprintf(payload, sizeof(payload),
+    "{\"name\":\"Set Water Empty\",\"unique_id\":\"%s_cal_empty\","
+    "\"command_topic\":\"%s\",\"payload_press\":\"waterCalEmpty\","
+    "\"icon\":\"mdi:cup-off\",\"entity_category\":\"config\",%s}",
+    UNIT_ID, CMD_TOPIC, dev);
+  mqtt.publish(DISC_BTN_CAL_EMPTY, payload, true);
 
   snprintf(cmdTopic, sizeof(cmdTopic), "%s/piezoPin", CONFIG_SET_PREFIX);
   snprintf(payload, sizeof(payload),
@@ -1927,11 +2027,12 @@ void setup() {
       // Take an initial reading to seed waterLevelLow before loop() starts
       int dist = lox.readRangeSingleMillimeters();
       if (lox.timeoutOccurred()) dist = cfg.waterEmptyMm;  // fail safe
+      smoothedDistMm = (float)dist;  // seed EMA so first poll doesn't start from -1
       int range = cfg.waterEmptyMm - cfg.waterFullMm;
       waterLevelPct = (range > 0)
         ? constrain(100 * (cfg.waterEmptyMm - dist) / range, 0, 100)
         : 0;
-      waterLevelLow = (dist >= cfg.waterEmptyMm);
+      waterLevelLow = (waterLevelPct < cfg.waterLockPct);
       logf("Water     — VL53L0X ready (SDA=GPIO14, SCL=GPIO15), dist=%dmm, level=%d%%, state=%s\n",
         dist, waterLevelPct, waterLevelLow ? "LOW" : "OK");
     } else {
@@ -2118,6 +2219,22 @@ void loop() {
   if (pendingConfigUpdate) {
     pendingConfigUpdate = false;
     applyConfigUpdate(pendingConfigPayload);
+  }
+
+  // ── Water level calibration ───────────────────────────────
+  if (pendingWaterCalFull && smoothedDistMm >= 0.0f) {
+    pendingWaterCalFull = false;
+    cfg.waterFullMm = (int)smoothedDistMm;
+    saveConfig(cfg);
+    if (mqtt.connected()) publishConfigState();
+    logf("Water     — calibrated FULL at %dmm\n", cfg.waterFullMm);
+  }
+  if (pendingWaterCalEmpty && smoothedDistMm >= 0.0f) {
+    pendingWaterCalEmpty = false;
+    cfg.waterEmptyMm = (int)smoothedDistMm;
+    saveConfig(cfg);
+    if (mqtt.connected()) publishConfigState();
+    logf("Water     — calibrated EMPTY at %dmm\n", cfg.waterEmptyMm);
   }
 
   // ── Deferred restart ──────────────────────────────────────
