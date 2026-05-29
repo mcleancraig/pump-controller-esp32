@@ -145,7 +145,7 @@ Set `fwChannel` to `beta` via MQTT or HA to track pre-release builds instead.
 
 Requires [arduino-cli](https://arduino.github.io/arduino-cli/) and the `esp32:esp32` platform. Also requires the **Pololu VL53L0X** library (`arduino-cli lib install "VL53L0X"`).
 
-> **Important:** the Waveshare ESP32-C6-Zero uses USB CDC. Always include `CDCOnBoot=cdc` in the FQBN or serial output will be silently routed to UART0 and nothing will appear on the monitor.
+> **Important:** always use the board-specific FQBN `esp32:esp32:waveshare_esp32_c6_zero`. The generic `esp32c6` variant sets different Wire defaults (SDA=23, SCL=22) and will silently break I2C. CDCOnBoot is enabled by default on the Waveshare variant.
 
 ```bash
 # Compile
@@ -153,7 +153,7 @@ Requires [arduino-cli](https://arduino.github.io/arduino-cli/) and the `esp32:es
 
 # Upload
 arduino-cli upload -p /dev/cu.usbmodem* \
-  --fqbn esp32:esp32:esp32c6:CDCOnBoot=cdc \
+  --fqbn esp32:esp32:waveshare_esp32_c6_zero \
   build/pump-controller-esp32.ino.bin
 ```
 
