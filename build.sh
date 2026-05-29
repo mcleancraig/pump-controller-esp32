@@ -2,7 +2,7 @@
 set -e
 
 SKETCH="pump-controller-esp32.ino"
-FQBN="esp32:esp32:esp32c6:CDCOnBoot=cdc"
+FQBN="esp32:esp32:waveshare_esp32_c6_zero"
 
 arduino-cli compile \
   --fqbn "$FQBN" \
