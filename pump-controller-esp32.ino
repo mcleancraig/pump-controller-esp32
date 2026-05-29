@@ -367,6 +367,7 @@ char DISC_CFG_WATER_FULL[128];
 char DISC_CFG_WATER_EMPTY[128];
 char DISC_CFG_WATER_LOCK[128];
 char DISC_CFG_WATER_UNLOCK[128];
+char DISC_WATER_DIST[128];
 char DISC_BTN_CAL_FULL[128];
 char DISC_BTN_CAL_EMPTY[128];
 char DISC_CFG_PIEZO_PIN[128];
@@ -427,6 +428,8 @@ void buildDerivedConfig() {
     "%s/number/%s_cfg_water_lock/config",      HA_DISCOVERY_PREFIX, UNIT_ID);
   snprintf(DISC_CFG_WATER_UNLOCK,  sizeof(DISC_CFG_WATER_UNLOCK),
     "%s/number/%s_cfg_water_unlock/config",    HA_DISCOVERY_PREFIX, UNIT_ID);
+  snprintf(DISC_WATER_DIST,        sizeof(DISC_WATER_DIST),
+    "%s/sensor/%s_water_dist/config",          HA_DISCOVERY_PREFIX, UNIT_ID);
   snprintf(DISC_BTN_CAL_FULL,      sizeof(DISC_BTN_CAL_FULL),
     "%s/button/%s_cal_full/config",            HA_DISCOVERY_PREFIX, UNIT_ID);
   snprintf(DISC_BTN_CAL_EMPTY,     sizeof(DISC_BTN_CAL_EMPTY),
@@ -1035,6 +1038,13 @@ void buzzBoot() {
   }
 }
 
+void buzzCalibration() {
+  // Low → high: 80ms each — short "done" confirmation
+  buzz(2000, 80);
+  delay(30);
+  buzz(3000, 80);
+}
+
 void stopPump(int idx, bool doBuzz = true) {
   if (idx < 0 || idx >= MAX_PUMPS) return;
   bool wasRunning = pumpSlot[idx].running;
@@ -1622,6 +1632,21 @@ void publishHADiscovery() {
     payload[0] = '\0';
   }
   mqtt.publish(DISC_WATER_PCT, payload, true);
+
+  // ── Water level sensor — live distance (mm) ───────────────
+  if (cfg.waterLevelPin >= 0) {
+    snprintf(payload, sizeof(payload),
+      "{\"name\":\"Water Distance (mm)\",\"unique_id\":\"%s_water_dist\","
+      "\"state_topic\":\"%s\","
+      "\"value_template\":\"{{value_json.dist_mm}}\","
+      "\"unit_of_measurement\":\"mm\","
+      "\"state_class\":\"measurement\","
+      "\"icon\":\"mdi:ruler\",%s}",
+      UNIT_ID, WATER_LEVEL_TOPIC, dev);
+  } else {
+    payload[0] = '\0';
+  }
+  mqtt.publish(DISC_WATER_DIST, payload, true);
 
   // ── Config: water sensor enabled switch ───────────────────
   snprintf(cmdTopic, sizeof(cmdTopic), "%s/waterLevelPin", CONFIG_SET_PREFIX);
@@ -2236,14 +2261,18 @@ void loop() {
     cfg.waterFullMm = (int)smoothedDistMm;
     saveConfig(cfg);
     if (mqtt.connected()) publishConfigState();
-    logf("Water     — calibrated FULL at %dmm\n", cfg.waterFullMm);
+    logf("Water     — FULL calibrated: waterFullMm=%dmm (empty=%dmm, range=%dmm)\n",
+         cfg.waterFullMm, cfg.waterEmptyMm, cfg.waterEmptyMm - cfg.waterFullMm);
+    buzzCalibration();
   }
   if (pendingWaterCalEmpty && smoothedDistMm >= 0.0f) {
     pendingWaterCalEmpty = false;
     cfg.waterEmptyMm = (int)smoothedDistMm;
     saveConfig(cfg);
     if (mqtt.connected()) publishConfigState();
-    logf("Water     — calibrated EMPTY at %dmm\n", cfg.waterEmptyMm);
+    logf("Water     — EMPTY calibrated: waterEmptyMm=%dmm (full=%dmm, range=%dmm)\n",
+         cfg.waterEmptyMm, cfg.waterFullMm, cfg.waterEmptyMm - cfg.waterFullMm);
+    buzzCalibration();
   }
 
   // ── Deferred restart ──────────────────────────────────────
