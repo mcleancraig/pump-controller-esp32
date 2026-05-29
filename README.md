@@ -6,7 +6,7 @@ Firmware for a WiFi-connected garden pump controller based on the **Waveshare ES
 
 - **Up to 5 pumps** — each on a configurable GPIO, independently triggered via MQTT
 - **Hardware safety cap** — maximum pump run time enforced in firmware, not overridable via config or MQTT
-- **Water level sensor** — VL53L0X ToF distance sensor measures tank fill %; blocks and stops pumps when empty threshold is reached
+- **Water level sensor** — VL53L0X ToF distance sensor measures tank fill %; EMA-smoothed readings; blocks and stops pumps when empty threshold is reached; hysteresis prevents rapid lock/unlock cycling
 - **Piezo buzzer** — audio alerts for watering started, watering done, low water, and boot
 - **Captive portal** — first-boot WiFi and full device configuration via web browser
 - **MQTT** — per-pump command/state topics; unit heartbeat; availability LWT; config get/set per field
@@ -114,6 +114,8 @@ Publish a raw value (not JSON) to `garden/pump1/config/set/<field>`:
 | `waterLevelPin` | `ON` / `OFF` | `ON` | Enables/disables sensor |
 | `waterFullMm` | integer (mm) | `25` | Distance when tank is full |
 | `waterEmptyMm` | integer (mm) | `190` | Distance when tank is empty |
+| `waterLockPct` | integer (%) | `10` | Lock pumps below this level |
+| `waterUnlockPct` | integer (%) | `25` | Unlock pumps above this level |
 | `piezoPin` | integer (GPIO) | `21` | `-1` to disable |
 | `mqttBroker` | string | `192.168.1.10` | |
 | `staticIP` | `ON` / `OFF` | `ON` | |
@@ -126,8 +128,10 @@ Entities appear automatically via MQTT autodiscovery under the device **"Garden 
 - **Switch** per pump — starts/stops with configured duration
 - **Binary sensor** — Water Level (`device_class: problem`, ON = LOW)
 - **Sensor** — Water Level % (0–100, updates every 2 s)
+- **Sensor** — Water Distance mm (live smoothed reading; use when calibrating)
+- **Button** — Set Water Full / Set Water Empty (calibration; beeps on save)
 - **Switch** — Water Sensor enable/disable
-- **Number** — Water Full Distance (mm) / Water Empty Distance (mm)
+- **Number** — Water Full Distance / Water Empty Distance / Lock % / Unlock %
 - **Number** — Piezo Buzzer Pin, Pump GPIO pins, Pump durations
 - **Switch** — Static IP enable
 - **Text** — IP / gateway / subnet / DNS / MQTT broker / syslog host
@@ -145,7 +149,7 @@ Set `fwChannel` to `beta` via MQTT or HA to track pre-release builds instead.
 
 Requires [arduino-cli](https://arduino.github.io/arduino-cli/) and the `esp32:esp32` platform. Also requires the **Pololu VL53L0X** library (`arduino-cli lib install "VL53L0X"`).
 
-> **Important:** the Waveshare ESP32-C6-Zero uses USB CDC. Always include `CDCOnBoot=cdc` in the FQBN or serial output will be silently routed to UART0 and nothing will appear on the monitor.
+> **Important:** always use the board-specific FQBN `esp32:esp32:waveshare_esp32_c6_zero`. The generic `esp32c6` variant sets different Wire defaults (SDA=23, SCL=22) and will silently break I2C. CDCOnBoot is enabled by default on the Waveshare variant.
 
 ```bash
 # Compile
@@ -153,7 +157,7 @@ Requires [arduino-cli](https://arduino.github.io/arduino-cli/) and the `esp32:es
 
 # Upload
 arduino-cli upload -p /dev/cu.usbmodem* \
-  --fqbn esp32:esp32:esp32c6:CDCOnBoot=cdc \
+  --fqbn esp32:esp32:waveshare_esp32_c6_zero \
   build/pump-controller-esp32.ino.bin
 ```
 
