@@ -16,12 +16,17 @@
 
 // ═══════════════════════════════════════════════════════════
 //  v1.4.0
+//  - Build fix: use esp32:esp32:waveshare_esp32_c6_zero FQBN. Generic esp32c6
+//    variant sets Wire defaults to SDA=23/SCL=22, silently breaking I2C on OTA.
 //  - EMA smoothing on VL53L0X readings (alpha=0.2) to reduce surface noise.
 //  - Low-water hysteresis: pumps lock at <waterLockPct% (default 10%),
 //    unlock at >waterUnlockPct% (default 25%). Both configurable via HA/MQTT.
 //  - Calibration buttons in HA: "Set as Full" / "Set as Empty" save the
 //    current smoothed distance as waterFullMm / waterEmptyMm.
-//  - dist_mm added to water level MQTT payload for live monitoring.
+//  - Water Distance (mm) HA sensor: live smoothed distance for calibration.
+//  - Calibration beep: short low→high tone confirms Set Full / Set Empty.
+//  - Syslog: water sensor status re-logged after syslogFlush() so it is
+//    visible in syslog (boot messages are discarded to avoid ARP blocking).
 //
 //  v1.3.0
 //  - Replace Hall/reed binary water sensor with VL53L0X ToF distance sensor.
@@ -90,7 +95,7 @@
 //  - MQTT callback safety: no publish() inside callback; deferred via flags
 // ═══════════════════════════════════════════════════════════
 
-#define FIRMWARE_VERSION "1.4.0-b04"
+#define FIRMWARE_VERSION "1.4.0"
 
 // ── Hardware constants ────────────────────────────────────
 const int BTN_BOOT          = 9;   // Boot button — GPIO9 on Waveshare C6-Zero / XIAO C6
