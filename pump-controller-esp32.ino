@@ -192,6 +192,7 @@ const char* NVS_MAGIC_KEY   = "magic";
 const char* NVS_MAGIC_VALUE = "pump-ctrl-1";
 
 // Forward-declare _logf so logf macro compiles before first use
+void _logf(const char* func, const char* fmt, ...);
 #define logf(fmt, ...) _logf(__func__, fmt, ##__VA_ARGS__)
 
 void loadConfig() {
