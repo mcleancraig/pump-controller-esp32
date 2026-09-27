@@ -105,7 +105,7 @@ const int PIEZO_PIN_DEFAULT = 21;  // Passive piezo buzzer — GPIO21 (free on C
 
 // ── Safety cap ────────────────────────────────────────────
 // Firmware-enforced maximum run time. Cannot be raised via config or MQTT.
-const int PUMP_MAX_DURATION_S = 30;
+const int PUMP_MAX_DURATION_S = 300;
 
 // ── Timing ────────────────────────────────────────────────
 const int AP_TIMEOUT_MIN            = 10;
@@ -792,7 +792,7 @@ function updatePumpRows() {
         '<label style="flex:0 0 auto;margin:0;font-size:.85em">GPIO pin</label>' +
         '<input type="number" name="pumpPin' + i + '" value="' + n + '" min="0" max="28">' +
         '<label style="flex:0 0 auto;margin:0;font-size:.85em">Duration (s)</label>' +
-        '<input type="number" name="pumpDur' + i + '" value="5" min="1" max="30">' +
+        '<input type="number" name="pumpDur' + i + '" value="5" min="1" max="300">' +
       '</div>';
     container.appendChild(div);
   }
