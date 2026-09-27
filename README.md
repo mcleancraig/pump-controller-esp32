@@ -5,7 +5,7 @@ Firmware for a WiFi-connected garden pump controller based on the **Waveshare ES
 ## Features
 
 - **Up to 5 pumps** — each on a configurable GPIO, independently triggered via MQTT
-- **Hardware safety cap** — maximum pump run time enforced in firmware, not overridable via config or MQTT
+- **Hardware safety cap** — maximum pump run time (300 s) enforced in firmware, not overridable via config or MQTT
 - **Water level sensor** — VL53L0X ToF distance sensor measures tank fill %; EMA-smoothed readings; blocks and stops pumps when empty threshold is reached; hysteresis prevents rapid lock/unlock cycling
 - **Piezo buzzer** — audio alerts for watering started, watering done, low water, and boot
 - **Captive portal** — first-boot WiFi and full device configuration via web browser

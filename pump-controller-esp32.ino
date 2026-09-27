@@ -15,6 +15,11 @@
 #include "esp_task_wdt.h"
 
 // ═══════════════════════════════════════════════════════════
+//  v1.5.0
+//  - Safety cap PUMP_MAX_DURATION_S raised from 30 s to 300 s.
+//  - Build fix: real forward declaration for _logf (auto-prototype
+//    generation fails on arduino-cli 1.5.1 / esp32 core 3.3.11).
+//
 //  v1.4.0
 //  - Build fix: use esp32:esp32:waveshare_esp32_c6_zero FQBN. Generic esp32c6
 //    variant sets Wire defaults to SDA=23/SCL=22, silently breaking I2C on OTA.
@@ -95,7 +100,7 @@
 //  - MQTT callback safety: no publish() inside callback; deferred via flags
 // ═══════════════════════════════════════════════════════════
 
-#define FIRMWARE_VERSION "1.4.0"
+#define FIRMWARE_VERSION "1.5.0"
 
 // ── Hardware constants ────────────────────────────────────
 const int BTN_BOOT          = 9;   // Boot button — GPIO9 on Waveshare C6-Zero / XIAO C6
@@ -105,7 +110,7 @@ const int PIEZO_PIN_DEFAULT = 21;  // Passive piezo buzzer — GPIO21 (free on C
 
 // ── Safety cap ────────────────────────────────────────────
 // Firmware-enforced maximum run time. Cannot be raised via config or MQTT.
-const int PUMP_MAX_DURATION_S = 30;
+const int PUMP_MAX_DURATION_S = 300;
 
 // ── Timing ────────────────────────────────────────────────
 const int AP_TIMEOUT_MIN            = 10;
@@ -192,6 +197,7 @@ const char* NVS_MAGIC_KEY   = "magic";
 const char* NVS_MAGIC_VALUE = "pump-ctrl-1";
 
 // Forward-declare _logf so logf macro compiles before first use
+void _logf(const char* func, const char* fmt, ...);
 #define logf(fmt, ...) _logf(__func__, fmt, ##__VA_ARGS__)
 
 void loadConfig() {
@@ -792,7 +798,7 @@ function updatePumpRows() {
         '<label style="flex:0 0 auto;margin:0;font-size:.85em">GPIO pin</label>' +
         '<input type="number" name="pumpPin' + i + '" value="' + n + '" min="0" max="28">' +
         '<label style="flex:0 0 auto;margin:0;font-size:.85em">Duration (s)</label>' +
-        '<input type="number" name="pumpDur' + i + '" value="5" min="1" max="30">' +
+        '<input type="number" name="pumpDur' + i + '" value="5" min="1" max="300">' +
       '</div>';
     container.appendChild(div);
   }
