@@ -15,6 +15,11 @@
 #include "esp_task_wdt.h"
 
 // ═══════════════════════════════════════════════════════════
+//  v1.5.0
+//  - Safety cap PUMP_MAX_DURATION_S raised from 30 s to 300 s.
+//  - Build fix: real forward declaration for _logf (auto-prototype
+//    generation fails on arduino-cli 1.5.1 / esp32 core 3.3.11).
+//
 //  v1.4.0
 //  - Build fix: use esp32:esp32:waveshare_esp32_c6_zero FQBN. Generic esp32c6
 //    variant sets Wire defaults to SDA=23/SCL=22, silently breaking I2C on OTA.
@@ -95,7 +100,7 @@
 //  - MQTT callback safety: no publish() inside callback; deferred via flags
 // ═══════════════════════════════════════════════════════════
 
-#define FIRMWARE_VERSION "1.5.0-b01"
+#define FIRMWARE_VERSION "1.5.0"
 
 // ── Hardware constants ────────────────────────────────────
 const int BTN_BOOT          = 9;   // Boot button — GPIO9 on Waveshare C6-Zero / XIAO C6
